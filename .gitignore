@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+dist/
+data/learning_state.json
+data/learning_state.json.*.tmp

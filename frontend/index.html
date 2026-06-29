@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CS336 从零学习平台</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Stanford CS336 Spring 2026</p>
+          <h1>从零理解语言模型</h1>
+        </div>
+        <div class="topbar-actions">
+          <label class="search-box" for="searchInput">
+            <span aria-hidden="true">⌕</span>
+            <input id="searchInput" type="search" placeholder="搜索 token、attention、RLHF..." />
+          </label>
+          <div class="progress-pill">
+            <span id="progressText">0 / 0</span>
+            <div class="progress-track"><div id="progressBar"></div></div>
+          </div>
+        </div>
+      </header>
+
+      <main class="layout">
+        <aside class="sidebar">
+          <div class="section-heading">
+            <span>学习阶段</span>
+            <button id="resetProgress" class="ghost-button" type="button">重置</button>
+          </div>
+          <div id="phaseList" class="phase-list"></div>
+        </aside>
+
+        <section class="workspace">
+          <div class="workspace-head">
+            <div>
+              <p id="lessonMeta" class="eyebrow">Lecture</p>
+              <h2 id="lessonTitle">加载中...</h2>
+            </div>
+            <button id="markDone" class="primary-button" type="button">标记完成</button>
+          </div>
+
+          <nav class="tabs" aria-label="课程内容">
+            <button class="tab active" data-tab="overview" type="button">总览</button>
+            <button class="tab" data-tab="math" type="button">数学</button>
+            <button class="tab" data-tab="code" type="button">代码</button>
+            <button class="tab" data-tab="practice" type="button">练习</button>
+            <button class="tab" data-tab="map" type="button">知识图</button>
+            <button class="tab" data-tab="mastery" type="button">标准</button>
+            <button class="tab" data-tab="system" type="button">闭环</button>
+          </nav>
+
+          <div id="lessonBody" class="lesson-body"></div>
+        </section>
+
+        <aside class="utility">
+          <section class="panel">
+            <div class="panel-title">
+              <span>学习控制台</span>
+              <button id="refreshDashboard" class="ghost-button" type="button">刷新</button>
+            </div>
+            <div id="nextActionPanel" class="console-stack"></div>
+            <div class="console-divider"></div>
+            <div class="panel-title compact-title"><span>掌握证据</span></div>
+            <textarea id="evidenceText" class="plain-editor" placeholder="写下你对当前课程的解释、推导、实验结果或仍然不懂的问题。"></textarea>
+            <div class="lab-row">
+              <label for="evidenceConfidence">信心</label>
+              <input id="evidenceConfidence" type="range" min="0" max="3" step="1" value="2" />
+            </div>
+            <button id="saveEvidence" class="secondary-button" type="button">提交证据</button>
+            <div class="console-divider"></div>
+            <div class="panel-title compact-title"><span>复习结果</span></div>
+            <div class="review-buttons">
+              <button data-review="again" type="button">重来</button>
+              <button data-review="hard" type="button">困难</button>
+              <button data-review="good" type="button">掌握</button>
+              <button data-review="easy" type="button">轻松</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title">
+              <span>交互实验</span>
+              <select id="labSelect" aria-label="选择实验"></select>
+            </div>
+            <div id="labPanel"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title">
+              <span>主题解释</span>
+            </div>
+            <div class="explain-form">
+              <input id="explainInput" type="text" placeholder="输入一个主题，例如 KV cache" />
+              <button id="explainButton" class="secondary-button" type="button">解释</button>
+            </div>
+            <div id="explainResult" class="explain-result"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title">
+              <span>自测</span>
+              <select id="quizSelect" aria-label="选择自测"></select>
+            </div>
+            <div id="quizPanel"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+    <script src="app.js" type="module"></script>
+  </body>
+</html>

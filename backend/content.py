@@ -216,6 +216,57 @@ LESSON_SOURCE_URLS = {
 }
 
 
+def raw_github_material_url(url):
+    marker = "https://github.com/stanford-cs336/lectures/blob/main/"
+    if url.startswith(marker):
+        return "https://raw.githubusercontent.com/stanford-cs336/lectures/main/" + url.removeprefix(marker)
+    return url
+
+
+def official_material_for(lesson):
+    url = LESSON_SOURCE_URLS.get(lesson["id"], SOURCE_MAP["schedule"]["url"])
+    material_url = raw_github_material_url(url)
+    if url.endswith(".pdf"):
+        kind = "slides-pdf"
+        label = "官方 PDF 幻灯片"
+        embed_url = material_url
+    elif "trace=lecture_" in url:
+        kind = "lecture-trace"
+        label = "官方 lecture trace"
+        embed_url = url
+    else:
+        kind = "schedule"
+        label = "官方课程页面"
+        embed_url = ""
+
+    return {
+        "kind": kind,
+        "label": label,
+        "url": url,
+        "embed_url": embed_url,
+        "download_url": material_url,
+        "source_label": "Stanford CS336 official course materials",
+        "usage_steps": [
+            "先浏览官方材料的目录、标题和例子，不急着记住每个细节。",
+            "再回到本平台的总览，确认本讲到底在解决哪个语言模型问题。",
+            "打开数学标签，把讲义中的公式逐项对应到符号、shape、单位或概率含义。",
+            "打开代码标签，把讲义中的实现路径对应到最小代码骨架。",
+            "最后提交掌握证据：用自己的话解释一个公式、一个代码片段和一个常见误区。",
+        ],
+        "focus_points": [
+            f"本讲主题：{lesson['summary']}",
+            "优先找出和本平台数学页相同的公式或资源估算关系。",
+            "优先找出和本平台代码页相同的变量名、张量 shape 或训练流程。",
+            "遇到讲义细节和本平台解释不一致时，以官方材料为准，并记录到学习证据里。",
+        ],
+        "explanation_prompts": [
+            "这份官方材料里哪一页或哪一段最能说明本讲核心问题？",
+            "材料中的符号如何对应到代码变量和张量形状？",
+            "如果要用玩具例子复现本讲，你会保留哪些最小组件？",
+        ],
+    }
+
+
 FORMULA_AUDIT = {
     "X in R^(batch x seq x d_model)": {
         "latex": r"X \in \mathbb{R}^{B \times T \times d_{\mathrm{model}}}",
@@ -1229,6 +1280,7 @@ def enriched_lessons():
         enriched["math"] = [enrich_math_item(item) for item in lesson.get("math", [])]
         enriched["code_explanation"] = code_explanation_for(lesson)
         enriched["official_source"] = LESSON_SOURCE_URLS.get(lesson["id"], SOURCE_MAP["schedule"]["url"])
+        enriched["official_material"] = official_material_for(enriched)
         enriched["mastery_gate"] = mastery_gate_by_phase(lesson["phase"])
         enriched["precision_note"] = precision_note_for(lesson["id"])
         lessons.append(enriched)

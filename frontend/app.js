@@ -55,6 +55,12 @@ const els = {
   saveEvidence: document.querySelector("#saveEvidence"),
   accountPanel: document.querySelector("#accountPanel"),
   cloudModeBadge: document.querySelector("#cloudModeBadge"),
+  accountOpen: document.querySelector("#accountOpen"),
+  accountStatusDot: document.querySelector("#accountStatusDot"),
+  accountStatusText: document.querySelector("#accountStatusText"),
+  accountStatusHint: document.querySelector("#accountStatusHint"),
+  accountModal: document.querySelector("#accountModal"),
+  accountModalBody: document.querySelector("#accountModalBody"),
 };
 
 init();
@@ -146,6 +152,13 @@ function attachEvents() {
   });
   els.refreshDashboard.addEventListener("click", refreshLearningState);
   els.saveEvidence.addEventListener("click", submitEvidence);
+  els.accountOpen?.addEventListener("click", openAccountModal);
+  els.accountModal?.addEventListener("click", (event) => {
+    if (event.target === els.accountModal || event.target.closest("[data-account-close]")) closeAccountModal();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && els.accountModal && !els.accountModal.hidden) closeAccountModal();
+  });
   document.querySelectorAll("[data-review]").forEach((button) => {
     button.addEventListener("click", () => submitReview(button.dataset.review));
   });
@@ -374,9 +387,10 @@ function mergeArrayById(left, right) {
   return [...output.values()].sort((a, b) => String(a.created_at || a.timestamp || "").localeCompare(String(b.created_at || b.timestamp || "")));
 }
 
-async function sendMagicLink() {
+async function sendMagicLink(trigger) {
   if (!state.cloud.client) return;
-  const email = document.querySelector("#accountEmail")?.value.trim();
+  const scope = trigger?.closest(".account-stack") || document;
+  const email = scope.querySelector("[data-account-email]")?.value.trim();
   if (!email) {
     state.cloud.error = "请输入邮箱。";
     renderAccountPanel();
@@ -1067,6 +1081,7 @@ function renderLesson() {
   renderLessonHeader();
   const lesson = getCurrentLesson();
   if (state.tab === "overview") renderOverview(lesson);
+  if (state.tab === "source") renderSource(lesson);
   if (state.tab === "math") renderMath(lesson);
   if (state.tab === "code") renderCode(lesson);
   if (state.tab === "practice") renderPractice(lesson);
@@ -1125,6 +1140,101 @@ function renderOverview(lesson) {
       <section class="info-band amber">
         <h3>完成检查点</h3>
         <p>${escapeHtml(lesson.checkpoint)}</p>
+      </section>
+    </div>
+  `;
+}
+
+function renderSource(lesson) {
+  const material = lesson.official_material || {
+    label: "官方课程页面",
+    url: lesson.official_source,
+    embed_url: "",
+    download_url: lesson.official_source,
+    kind: "schedule",
+    usage_steps: [],
+    focus_points: [],
+    explanation_prompts: [],
+  };
+  const primaryMath = lesson.math?.[0];
+  const materialFrame = material.embed_url
+    ? `
+      <iframe
+        class="material-frame"
+        src="${escapeHtml(material.embed_url)}"
+        title="${escapeHtml(lesson.lecture)} 官方材料"
+        loading="lazy"
+      ></iframe>
+    `
+    : `
+      <div class="material-placeholder">
+        <strong>这讲没有可嵌入的官方讲义。</strong>
+        <p>请使用下方按钮打开 CS336 官方课程页面，并按本页的阅读流程记录笔记。</p>
+      </div>
+    `;
+
+  els.lessonBody.innerHTML = `
+    <div class="content-grid source-layout">
+      <section class="official-material-card">
+        <div class="material-head">
+          <div>
+            <span class="source-badge">${escapeHtml(material.label || "官方材料")}</span>
+            <h3>${escapeHtml(lesson.lecture)} · ${escapeHtml(lesson.title)}</h3>
+          </div>
+          <div class="material-actions">
+            <a class="secondary-link" href="${escapeHtml(material.url)}" target="_blank" rel="noreferrer">打开官方材料</a>
+            ${
+              material.download_url && material.download_url !== material.url
+                ? `<a class="ghost-link" href="${escapeHtml(material.download_url)}" target="_blank" rel="noreferrer">打开原始文件</a>`
+                : ""
+            }
+          </div>
+        </div>
+        ${materialFrame}
+        <p class="source-disclaimer">官方材料来自 Stanford CS336 页面或其官方 GitHub 讲义链接。本平台只做嵌入、跳转和中文学习拆解；事实边界以官方材料为准。</p>
+      </section>
+
+      <section class="source-guidance-grid">
+        <article class="source-guide-card">
+          <h3>原始材料阅读顺序</h3>
+          <ol>
+            ${(material.usage_steps || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+          </ol>
+        </article>
+        <article class="source-guide-card">
+          <h3>本讲讲解对应点</h3>
+          <ul>
+            ${(material.focus_points || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+          </ul>
+        </article>
+      </section>
+
+      <section class="source-guidance-grid">
+        <article class="source-guide-card">
+          <h3>从讲义回到公式</h3>
+          ${
+            primaryMath
+              ? `
+                <p class="small-text">先在官方材料中定位和下面公式同义的定义、推导或资源估算，再打开“数学”标签逐项解释符号。</p>
+                ${formulaMarkup(primaryMath)}
+                <p>${escapeHtml(primaryMath.explain)}</p>
+              `
+              : `<p class="small-text">这讲更偏概念或研究视角。请优先记录材料中的问题设定、实验指标和失败模式。</p>`
+          }
+        </article>
+        <article class="source-guide-card">
+          <h3>从讲义回到代码</h3>
+          <p class="small-text">把官方材料中的实现路径压缩成最小代码骨架，确认输入、核心操作和输出。完整逐行解释在“代码”标签。</p>
+          ${codePanel(lesson.code, detectLanguage(lesson.code), "本平台最小对应代码")}
+        </article>
+      </section>
+
+      <section class="info-band amber">
+        <h3>学习产出要求</h3>
+        <ul class="practice-list">
+          ${(material.explanation_prompts || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+          <li>完成后在右侧“掌握证据”中提交一段解释，必须同时包含官方材料引用位置、一个公式解释和一个代码对应点。</li>
+        </ul>
       </section>
     </div>
   `;
@@ -1363,43 +1473,83 @@ function renderLearningConsole() {
 }
 
 function renderAccountPanel() {
+  renderAccountEntry();
+  renderAccountModal();
   if (!els.accountPanel) return;
   if (els.cloudModeBadge) {
     els.cloudModeBadge.textContent = cloudBadgeText();
     els.cloudModeBadge.dataset.mode = cloudBadgeMode();
   }
 
+  els.accountPanel.innerHTML = accountMarkup("panel");
+}
+
+function renderAccountEntry() {
+  if (!els.accountOpen) return;
+  const mode = cloudBadgeMode();
+  const text = state.cloud.user ? "账号已登录" : "账号 / 登录";
+  const hint = state.cloud.loading
+    ? "检查中"
+    : state.cloud.user
+      ? "云端同步"
+      : state.cloud.configured
+        ? "可登录"
+        : "本机保存";
+  if (els.accountStatusDot) els.accountStatusDot.dataset.mode = mode;
+  if (els.accountStatusText) els.accountStatusText.textContent = text;
+  if (els.accountStatusHint) els.accountStatusHint.textContent = hint;
+  els.accountOpen.dataset.mode = mode;
+}
+
+function renderAccountModal() {
+  if (!els.accountModalBody) return;
+  els.accountModalBody.innerHTML = accountMarkup("modal");
+}
+
+function accountMarkup(context) {
   if (state.cloud.loading) {
-    els.accountPanel.innerHTML = `<p class="small-text">正在检查云同步配置...</p>`;
-    return;
+    return `<p class="small-text">正在检查账号与云同步配置...</p>`;
   }
 
   if (!state.cloud.configured) {
-    els.accountPanel.innerHTML = `
-      <p class="small-text">当前使用本机模式。学习状态保存在此浏览器，可离线使用；配置 Supabase 后会启用账号登录和跨设备同步。</p>
+    return `
+      <div class="account-user local-account">
+        <strong>本机学习档案</strong>
+        <span>云登录未配置，当前浏览器会继续保存学习进度。</span>
+      </div>
+      <p class="small-text">你现在仍可完整学习、提交证据、做测验和记录复习。要启用个人账号与跨设备同步，需要给 GitHub Pages 注入 Supabase URL 和 Anon Key。</p>
       <div class="cloud-facts">
         <span>离线可用</span>
         <span>本机保存</span>
-        <span>可迁移到云端</span>
+        <span>登录待配置</span>
       </div>
+      <div class="account-login-disabled">
+        <label class="account-field" for="accountEmail-${escapeHtml(context)}">
+          <span>邮箱登录</span>
+          <input id="accountEmail-${escapeHtml(context)}" type="email" placeholder="配置云同步后启用" disabled />
+        </label>
+        <div class="account-actions">
+          <button class="secondary-button" type="button" disabled>发送登录邮件</button>
+          <button class="ghost-button" type="button" disabled>GitHub 登录</button>
+        </div>
+      </div>
+      <p class="cloud-message warning">登录入口已在这里；当前部署还没有 Supabase 配置，所以暂时只能使用本机模式。</p>
     `;
-    return;
   }
 
   if (!state.cloud.client) {
-    els.accountPanel.innerHTML = `
+    return `
       <p class="small-text">云同步配置存在，但客户端初始化失败。</p>
       ${cloudMessageMarkup()}
     `;
-    return;
   }
 
   if (!state.cloud.user) {
-    els.accountPanel.innerHTML = `
+    return `
       <p class="small-text">登录后，系统会把本机学习状态与云端档案合并，并在每次学习行为后同步。</p>
-      <label class="account-field" for="accountEmail">
+      <label class="account-field" for="accountEmail-${escapeHtml(context)}">
         <span>邮箱</span>
-        <input id="accountEmail" type="email" placeholder="you@example.com" autocomplete="email" />
+        <input id="accountEmail-${escapeHtml(context)}" data-account-email type="email" placeholder="you@example.com" autocomplete="email" />
       </label>
       <div class="account-actions">
         <button class="secondary-button" type="button" data-cloud-action="magic">发送登录邮件</button>
@@ -1407,11 +1557,10 @@ function renderAccountPanel() {
       </div>
       ${cloudMessageMarkup()}
     `;
-    return;
   }
 
   const email = state.cloud.user.email || state.cloud.user.user_metadata?.user_name || state.cloud.user.id;
-  els.accountPanel.innerHTML = `
+  return `
     <div class="account-user">
       <strong>${escapeHtml(email)}</strong>
       <span>${escapeHtml(state.cloud.user.id)}</span>
@@ -1427,6 +1576,24 @@ function renderAccountPanel() {
     </div>
     ${cloudMessageMarkup()}
   `;
+}
+
+function openAccountModal() {
+  if (!els.accountModal) return;
+  renderAccountModal();
+  els.accountModal.hidden = false;
+  document.body.classList.add("modal-open");
+  window.setTimeout(() => {
+    const focusTarget = els.accountModal.querySelector("input:not([disabled]), button:not([disabled]), a");
+    focusTarget?.focus();
+  }, 0);
+}
+
+function closeAccountModal() {
+  if (!els.accountModal) return;
+  els.accountModal.hidden = true;
+  document.body.classList.remove("modal-open");
+  els.accountOpen?.focus();
 }
 
 function cloudBadgeText() {
@@ -2091,7 +2258,7 @@ function registerCopyPayload(text) {
 async function handleCopyClick(event) {
   const cloudAction = event.target.closest("[data-cloud-action]");
   if (cloudAction) {
-    if (cloudAction.dataset.cloudAction === "magic") await sendMagicLink();
+    if (cloudAction.dataset.cloudAction === "magic") await sendMagicLink(cloudAction);
     if (cloudAction.dataset.cloudAction === "github") await signInWithGitHub();
     if (cloudAction.dataset.cloudAction === "sync") await manualCloudSync();
     if (cloudAction.dataset.cloudAction === "signout") await signOutCloud();

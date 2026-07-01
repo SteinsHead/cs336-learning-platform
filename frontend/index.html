@@ -22,6 +22,13 @@
             <span id="progressText">0 / 0</span>
             <div class="progress-track"><div id="progressBar"></div></div>
           </div>
+          <button id="accountOpen" class="account-pill" type="button" aria-haspopup="dialog" aria-controls="accountModal">
+            <span id="accountStatusDot" class="account-status-dot" data-mode="local" aria-hidden="true"></span>
+            <span class="account-pill-copy">
+              <strong id="accountStatusText">账号 / 登录</strong>
+              <small id="accountStatusHint">本机保存</small>
+            </span>
+          </button>
         </div>
       </header>
 
@@ -45,6 +52,7 @@
 
           <nav class="tabs" aria-label="课程内容">
             <button class="tab active" data-tab="overview" type="button">总览</button>
+            <button class="tab" data-tab="source" type="button">讲义</button>
             <button class="tab" data-tab="math" type="button">数学</button>
             <button class="tab" data-tab="code" type="button">代码</button>
             <button class="tab" data-tab="practice" type="button">练习</button>
@@ -117,6 +125,18 @@
           </section>
         </aside>
       </main>
+      <div id="accountModal" class="account-modal" role="dialog" aria-modal="true" aria-labelledby="accountModalTitle" hidden>
+        <div class="account-dialog">
+          <div class="account-dialog-head">
+            <div>
+              <p class="eyebrow">Learning Account</p>
+              <h2 id="accountModalTitle">账号与学习进度</h2>
+            </div>
+            <button class="icon-button" type="button" data-account-close aria-label="关闭账号窗口">&times;</button>
+          </div>
+          <div id="accountModalBody" class="account-stack account-modal-body"></div>
+        </div>
+      </div>
     </div>
     <script src="config.js"></script>
     <script src="app.js" type="module"></script>

@@ -41,6 +41,29 @@ jobs:
       - name: Export static site
         run: python -B scripts/export_static.py
 
+      - name: Inject runtime config
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+          SUPABASE_AUTH_REDIRECT_URL: ${{ vars.SUPABASE_AUTH_REDIRECT_URL }}
+        run: |
+          python -B - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = {
+              "supabaseUrl": os.environ.get("SUPABASE_URL", ""),
+              "supabaseAnonKey": os.environ.get("SUPABASE_ANON_KEY", ""),
+              "supabaseAuthRedirectUrl": os.environ.get("SUPABASE_AUTH_REDIRECT_URL", ""),
+              "supabaseModuleUrl": "https://esm.sh/@supabase/supabase-js@2",
+          }
+          Path("dist/config.js").write_text(
+              "window.CS336_CONFIG = " + json.dumps(config, ensure_ascii=False, indent=2) + ";\n",
+              encoding="utf-8",
+          )
+          PY
+
       - name: Validate static curriculum
         run: python -B -c "import json; data=json.load(open('dist/data/curriculum.json', encoding='utf-8')); assert len(data['lessons']) == 22; assert len([m for l in data['lessons'] for m in l.get('math', [])]) == 29"
 

@@ -1,5 +1,6 @@
 const STATIC_CURRICULUM_URL = "data/curriculum.json";
 const LOCAL_STATE_KEY = "cs336.learning_state.v2";
+const CONFIG = globalThis.CS336_CONFIG || {};
 
 const state = {
   data: null,
@@ -17,6 +18,16 @@ const state = {
   apiMode: "api",
   staticCurriculum: null,
   staticCurriculumPromise: null,
+  cloud: {
+    configured: false,
+    client: null,
+    user: null,
+    loading: true,
+    syncing: false,
+    lastSync: "",
+    message: "",
+    error: "",
+  },
   quizSelections: {},
 };
 
@@ -42,6 +53,8 @@ const els = {
   evidenceText: document.querySelector("#evidenceText"),
   evidenceConfidence: document.querySelector("#evidenceConfidence"),
   saveEvidence: document.querySelector("#saveEvidence"),
+  accountPanel: document.querySelector("#accountPanel"),
+  cloudModeBadge: document.querySelector("#cloudModeBadge"),
 };
 
 init();
@@ -61,6 +74,12 @@ async function init() {
   state.learningModel = model;
   state.masteryReport = report;
   state.studyPlan = plan;
+  await initCloud();
+  await hydrateCloudState();
+  state.serverState = await apiGet("state");
+  state.dashboard = await apiGet("dashboard");
+  state.masteryReport = await apiGet("mastery-report");
+  state.studyPlan = await apiGet("study-plan");
   state.currentLessonId = state.data.lessons[0].id;
   state.activeLab = state.data.labs[0].id;
   state.activeQuiz = state.data.quizzes[0].id;
@@ -72,6 +91,7 @@ async function init() {
   renderLab();
   renderQuiz();
   renderLearningConsole();
+  renderAccountPanel();
   updateProgress();
   attachEvents();
 }
@@ -207,10 +227,207 @@ async function staticPost(name, payload) {
     const reset = defaultBrowserState();
     recordLocalEvent(reset, "reset", "learning-state", "system");
     saveBrowserState(reset);
+    await saveCloudState(reset);
     return { state: reset, dashboard: buildDashboard(curriculum, reset) };
   }
   saveBrowserState(localState);
+  await saveCloudState(localState);
   return { state: localState, dashboard: buildDashboard(curriculum, localState) };
+}
+
+async function initCloud() {
+  state.cloud.configured = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseAnonKey);
+  state.cloud.loading = true;
+  state.cloud.message = "";
+  state.cloud.error = "";
+  if (!state.cloud.configured) {
+    state.cloud.loading = false;
+    return;
+  }
+
+  try {
+    const moduleUrl = CONFIG.supabaseModuleUrl || "https://esm.sh/@supabase/supabase-js@2";
+    const { createClient } = await import(moduleUrl);
+    state.cloud.client = createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+      },
+    });
+    const { data, error } = await state.cloud.client.auth.getSession();
+    if (error) throw error;
+    state.cloud.user = data.session?.user || null;
+    state.cloud.client.auth.onAuthStateChange(async (_event, session) => {
+      state.cloud.user = session?.user || null;
+      if (state.cloud.user) await hydrateCloudState();
+      await refreshLearningState();
+      renderAccountPanel();
+    });
+  } catch (error) {
+    state.cloud.error = readableError(error);
+  } finally {
+    state.cloud.loading = false;
+  }
+}
+
+async function hydrateCloudState() {
+  if (!canUseCloud()) return;
+  state.cloud.syncing = true;
+  state.cloud.error = "";
+  try {
+    const localState = loadBrowserState();
+    const remoteState = await fetchCloudState();
+    if (!remoteState) {
+      await saveCloudState(localState);
+      state.cloud.message = "已创建云端学习档案。";
+      return;
+    }
+    const merged = mergeLearningStates(localState, remoteState);
+    saveBrowserState(merged);
+    await saveCloudState(merged);
+    state.cloud.message = "云端学习状态已合并。";
+  } catch (error) {
+    state.cloud.error = readableError(error);
+  } finally {
+    state.cloud.syncing = false;
+    state.cloud.lastSync = nowIso();
+  }
+}
+
+function canUseCloud() {
+  return Boolean(state.cloud.configured && state.cloud.client && state.cloud.user);
+}
+
+async function fetchCloudState() {
+  if (!canUseCloud()) return null;
+  const { data, error } = await state.cloud.client
+    .from("learning_states")
+    .select("state, updated_at")
+    .eq("user_id", state.cloud.user.id)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.state || null;
+}
+
+async function saveCloudState(nextState) {
+  if (!canUseCloud()) return;
+  state.cloud.syncing = true;
+  state.cloud.error = "";
+  try {
+    const payload = {
+      user_id: state.cloud.user.id,
+      state: nextState,
+      updated_at: nowIso(),
+    };
+    const { error } = await state.cloud.client.from("learning_states").upsert(payload, { onConflict: "user_id" });
+    if (error) throw error;
+    state.cloud.lastSync = payload.updated_at;
+    state.cloud.message = "已同步到云端。";
+  } catch (error) {
+    state.cloud.error = readableError(error);
+  } finally {
+    state.cloud.syncing = false;
+  }
+}
+
+function mergeLearningStates(localState, remoteState) {
+  const merged = defaultBrowserState();
+  const localTime = Date.parse(localState.updated_at || "") || 0;
+  const remoteTime = Date.parse(remoteState.updated_at || "") || 0;
+  const newer = remoteTime > localTime ? remoteState : localState;
+
+  merged.profile = { ...merged.profile, ...(newer.profile || {}) };
+  merged.lesson_progress = mergeByUpdatedAt(localState.lesson_progress || {}, remoteState.lesson_progress || {});
+  merged.reviews = mergeByUpdatedAt(localState.reviews || {}, remoteState.reviews || {}, "last_reviewed_at");
+  merged.notes = mergeByUpdatedAt(localState.notes || {}, remoteState.notes || {});
+  merged.diagnostics = mergeByUpdatedAt(localState.diagnostics || {}, remoteState.diagnostics || {});
+  merged.quiz_attempts = mergeArrayById(localState.quiz_attempts || [], remoteState.quiz_attempts || []);
+  merged.evidence = mergeArrayById(localState.evidence || [], remoteState.evidence || []);
+  merged.lab_attempts = mergeArrayById(localState.lab_attempts || [], remoteState.lab_attempts || []);
+  merged.events = mergeArrayById(localState.events || [], remoteState.events || []).slice(-500);
+  merged.created_at = [localState.created_at, remoteState.created_at].filter(Boolean).sort()[0] || merged.created_at;
+  merged.updated_at = nowIso();
+  return merged;
+}
+
+function mergeByUpdatedAt(left, right, field = "updated_at") {
+  const output = { ...left };
+  Object.entries(right).forEach(([key, value]) => {
+    const current = output[key];
+    if (!current || (Date.parse(value?.[field] || value?.updated_at || "") || 0) >= (Date.parse(current?.[field] || current?.updated_at || "") || 0)) {
+      output[key] = value;
+    }
+  });
+  return output;
+}
+
+function mergeArrayById(left, right) {
+  const output = new Map();
+  [...left, ...right].forEach((item) => {
+    if (!item?.id) return;
+    const current = output.get(item.id);
+    if (!current || (Date.parse(item.updated_at || item.created_at || item.timestamp || "") || 0) >= (Date.parse(current.updated_at || current.created_at || current.timestamp || "") || 0)) {
+      output.set(item.id, item);
+    }
+  });
+  return [...output.values()].sort((a, b) => String(a.created_at || a.timestamp || "").localeCompare(String(b.created_at || b.timestamp || "")));
+}
+
+async function sendMagicLink() {
+  if (!state.cloud.client) return;
+  const email = document.querySelector("#accountEmail")?.value.trim();
+  if (!email) {
+    state.cloud.error = "请输入邮箱。";
+    renderAccountPanel();
+    return;
+  }
+  state.cloud.syncing = true;
+  state.cloud.error = "";
+  try {
+    const redirectTo = CONFIG.supabaseAuthRedirectUrl || location.href.split("#")[0];
+    const { error } = await state.cloud.client.auth.signInWithOtp({ email, options: { emailRedirectTo: redirectTo } });
+    if (error) throw error;
+    state.cloud.message = "登录邮件已发送，请在邮箱中打开链接。";
+  } catch (error) {
+    state.cloud.error = readableError(error);
+  } finally {
+    state.cloud.syncing = false;
+    renderAccountPanel();
+  }
+}
+
+async function signInWithGitHub() {
+  if (!state.cloud.client) return;
+  state.cloud.syncing = true;
+  state.cloud.error = "";
+  try {
+    const redirectTo = CONFIG.supabaseAuthRedirectUrl || location.href.split("#")[0];
+    const { error } = await state.cloud.client.auth.signInWithOAuth({ provider: "github", options: { redirectTo } });
+    if (error) throw error;
+  } catch (error) {
+    state.cloud.error = readableError(error);
+    state.cloud.syncing = false;
+    renderAccountPanel();
+  }
+}
+
+async function signOutCloud() {
+  if (!state.cloud.client) return;
+  await state.cloud.client.auth.signOut();
+  state.cloud.user = null;
+  state.cloud.message = "已退出账号，本机学习记录仍保留。";
+  renderAccountPanel();
+}
+
+async function manualCloudSync() {
+  await hydrateCloudState();
+  await refreshLearningState();
+  renderAccountPanel();
+}
+
+function readableError(error) {
+  return error?.message || String(error || "未知错误");
 }
 
 function defaultBrowserState() {
@@ -1145,6 +1362,102 @@ function renderLearningConsole() {
   `;
 }
 
+function renderAccountPanel() {
+  if (!els.accountPanel) return;
+  if (els.cloudModeBadge) {
+    els.cloudModeBadge.textContent = cloudBadgeText();
+    els.cloudModeBadge.dataset.mode = cloudBadgeMode();
+  }
+
+  if (state.cloud.loading) {
+    els.accountPanel.innerHTML = `<p class="small-text">正在检查云同步配置...</p>`;
+    return;
+  }
+
+  if (!state.cloud.configured) {
+    els.accountPanel.innerHTML = `
+      <p class="small-text">当前使用本机模式。学习状态保存在此浏览器，可离线使用；配置 Supabase 后会启用账号登录和跨设备同步。</p>
+      <div class="cloud-facts">
+        <span>离线可用</span>
+        <span>本机保存</span>
+        <span>可迁移到云端</span>
+      </div>
+    `;
+    return;
+  }
+
+  if (!state.cloud.client) {
+    els.accountPanel.innerHTML = `
+      <p class="small-text">云同步配置存在，但客户端初始化失败。</p>
+      ${cloudMessageMarkup()}
+    `;
+    return;
+  }
+
+  if (!state.cloud.user) {
+    els.accountPanel.innerHTML = `
+      <p class="small-text">登录后，系统会把本机学习状态与云端档案合并，并在每次学习行为后同步。</p>
+      <label class="account-field" for="accountEmail">
+        <span>邮箱</span>
+        <input id="accountEmail" type="email" placeholder="you@example.com" autocomplete="email" />
+      </label>
+      <div class="account-actions">
+        <button class="secondary-button" type="button" data-cloud-action="magic">发送登录邮件</button>
+        <button class="ghost-button" type="button" data-cloud-action="github">GitHub 登录</button>
+      </div>
+      ${cloudMessageMarkup()}
+    `;
+    return;
+  }
+
+  const email = state.cloud.user.email || state.cloud.user.user_metadata?.user_name || state.cloud.user.id;
+  els.accountPanel.innerHTML = `
+    <div class="account-user">
+      <strong>${escapeHtml(email)}</strong>
+      <span>${escapeHtml(state.cloud.user.id)}</span>
+    </div>
+    <div class="cloud-facts">
+      <span>云端同步</span>
+      <span>${state.cloud.lastSync ? `最近 ${formatTime(state.cloud.lastSync)}` : "等待同步"}</span>
+      <span>${state.cloud.syncing ? "同步中" : "就绪"}</span>
+    </div>
+    <div class="account-actions">
+      <button class="secondary-button" type="button" data-cloud-action="sync">立即同步</button>
+      <button class="ghost-button" type="button" data-cloud-action="signout">退出</button>
+    </div>
+    ${cloudMessageMarkup()}
+  `;
+}
+
+function cloudBadgeText() {
+  if (state.cloud.loading) return "检查中";
+  if (!state.cloud.configured) return "本机";
+  if (state.cloud.error) return "异常";
+  if (state.cloud.syncing) return "同步中";
+  if (state.cloud.user) return "云端";
+  return "未登录";
+}
+
+function cloudBadgeMode() {
+  if (!state.cloud.configured) return "local";
+  if (state.cloud.error) return "error";
+  if (state.cloud.user) return "cloud";
+  return "ready";
+}
+
+function cloudMessageMarkup() {
+  const messages = [];
+  if (state.cloud.message) messages.push(`<p class="cloud-message">${escapeHtml(state.cloud.message)}</p>`);
+  if (state.cloud.error) messages.push(`<p class="cloud-message error">${escapeHtml(state.cloud.error)}</p>`);
+  return messages.join("");
+}
+
+function formatTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
 function actionCards(actions) {
   if (!actions || actions.length === 0) return `<p class="small-text">暂无推荐动作。</p>`;
   return actions
@@ -1398,6 +1711,7 @@ async function refreshLearningState(render = true) {
   state.studyPlan = plan;
   state.completed = completedFromServer(state.serverState);
   renderLearningConsole();
+  renderAccountPanel();
   updateProgress();
   renderPhases(els.searchInput.value);
   if (render) renderLesson();
@@ -1775,6 +2089,15 @@ function registerCopyPayload(text) {
 }
 
 async function handleCopyClick(event) {
+  const cloudAction = event.target.closest("[data-cloud-action]");
+  if (cloudAction) {
+    if (cloudAction.dataset.cloudAction === "magic") await sendMagicLink();
+    if (cloudAction.dataset.cloudAction === "github") await signInWithGitHub();
+    if (cloudAction.dataset.cloudAction === "sync") await manualCloudSync();
+    if (cloudAction.dataset.cloudAction === "signout") await signOutCloud();
+    return;
+  }
+
   const diagnosticSave = event.target.closest("[data-save-diagnostic]");
   if (diagnosticSave) {
     await submitDiagnostic();

@@ -22,7 +22,7 @@ def main():
         shutil.rmtree(DIST)
     DIST.mkdir(parents=True)
 
-    for filename in ("index.html", "app.js", "styles.css"):
+    for filename in ("index.html", "app.js", "styles.css", "config.js"):
         copy_file(FRONTEND / filename, DIST / filename)
 
     data_dir = DIST / "data"

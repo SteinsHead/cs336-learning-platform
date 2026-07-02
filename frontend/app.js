@@ -30,12 +30,9 @@ const state = {
     error: "",
   },
   sourceReader: {
-    pdfjs: null,
-    pdf: null,
-    pdfUrl: "",
+    pdfImages: [],
     page: 1,
-    scale: 1.05,
-    renderTask: null,
+    scale: 1,
     traceEntries: [],
   },
   quizSelections: {},
@@ -87,8 +84,6 @@ function loadAppConfig() {
     ...base,
     ...Object.fromEntries(Object.entries(local).filter(([, value]) => String(value || "").trim())),
     supabaseModuleUrl: local.supabaseModuleUrl || base.supabaseModuleUrl || "https://esm.sh/@supabase/supabase-js@2",
-    pdfJsModuleUrl: local.pdfJsModuleUrl || base.pdfJsModuleUrl || "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs",
-    pdfJsWorkerUrl: local.pdfJsWorkerUrl || base.pdfJsWorkerUrl || "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs",
   };
 }
 
@@ -1206,9 +1201,13 @@ function renderSource(lesson) {
             <h3>${escapeHtml(lesson.lecture)} · ${escapeHtml(lesson.title)}</h3>
           </div>
           <div class="material-actions">
-            <a class="secondary-link" href="${escapeHtml(material.url)}" target="_blank" rel="noreferrer">打开官方材料</a>
             ${
-              material.download_url && material.download_url !== material.url
+              material.kind === "slides-pdf"
+                ? `<a class="ghost-link" href="${escapeHtml(material.url)}" target="_blank" rel="noreferrer">备用官方 PDF</a>`
+                : `<a class="secondary-link" href="${escapeHtml(material.url)}" target="_blank" rel="noreferrer">打开官方材料</a>`
+            }
+            ${
+              material.kind !== "slides-pdf" && material.download_url && material.download_url !== material.url
                 ? `<a class="ghost-link" href="${escapeHtml(material.download_url)}" target="_blank" rel="noreferrer">打开原始文件</a>`
                 : ""
             }
@@ -1272,14 +1271,14 @@ function renderSource(lesson) {
 
 function sourceReaderMarkup(lesson, material) {
   if (material.kind === "slides-pdf") {
-    const pdfUrl = material.local_reader_url || material.reader_url || material.download_url || "";
-    const pdfObjectUrl = material.reader_url || material.download_url || material.local_reader_url || "";
+    const pageCount = Number(material.page_count || material.page_images?.length || 0);
+    const hasPageImages = Array.isArray(material.page_images) && material.page_images.length > 0;
     return `
-      <div class="pdf-reader" data-pdf-url="${escapeHtml(pdfUrl)}">
+      <div class="pdf-reader" data-page-count="${pageCount}">
         <div class="reader-toolbar">
           <div>
             <button class="icon-button reader-button" type="button" data-pdf-action="prev" aria-label="上一页">‹</button>
-            <span class="reader-page-state"><span id="pdfPageNumber">1</span> / <span id="pdfPageCount">?</span></span>
+            <span class="reader-page-state"><span id="pdfPageNumber">${hasPageImages ? "1" : "0"}</span> / <span id="pdfPageCount">${pageCount || "0"}</span></span>
             <button class="icon-button reader-button" type="button" data-pdf-action="next" aria-label="下一页">›</button>
           </div>
           <div>
@@ -1287,13 +1286,21 @@ function sourceReaderMarkup(lesson, material) {
             <button class="ghost-button" type="button" data-pdf-action="zoom-in">放大</button>
           </div>
         </div>
-        <div id="pdfReaderStatus" class="reader-status">下方是平台内 PDF 预览；PDF.js canvas 阅读器正在作为增强层加载。</div>
-        <object id="pdfObjectFallback" class="pdf-object" data="${escapeHtml(pdfObjectUrl)}" type="application/pdf">
-          <p>当前浏览器无法内嵌 PDF。请使用上方官方材料链接，并把阅读笔记记录在本平台。</p>
-        </object>
-        <div class="pdf-canvas-wrap">
-          <canvas id="sourcePdfCanvas" aria-label="${escapeHtml(lesson.lecture)} PDF 幻灯片"></canvas>
-        </div>
+        <div id="pdfReaderStatus" class="reader-status">${hasPageImages ? "正在加载平台内幻灯片图片..." : "这份 PDF 尚未完成平台内图片预渲染。"}</div>
+        ${
+          hasPageImages
+            ? `
+              <div class="pdf-slide-stage">
+                <img id="pdfSlideImage" alt="${escapeHtml(lesson.lecture)} 幻灯片第 1 页" decoding="async" />
+              </div>
+            `
+            : `
+              <div class="material-placeholder">
+                <strong>PDF 图片阅读器尚未生成。</strong>
+                <p>平台不会自动打开或嵌入 PDF 文件，以避免浏览器触发下载。请等待 GitHub Pages 构建完成，或使用上方“官方材料”作为临时备用入口。</p>
+              </div>
+            `
+        }
       </div>
     `;
   }
@@ -1331,91 +1338,48 @@ async function initSourceReader(lesson, material) {
   }
 }
 
-async function loadPdfJs() {
-  if (state.sourceReader.pdfjs) return state.sourceReader.pdfjs;
-  const pdfjs = await import(CONFIG.pdfJsModuleUrl || "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs");
-  pdfjs.GlobalWorkerOptions.workerSrc = CONFIG.pdfJsWorkerUrl || "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs";
-  state.sourceReader.pdfjs = pdfjs;
-  return pdfjs;
-}
-
 async function initPdfReader(material) {
   const status = document.querySelector("#pdfReaderStatus");
-  const canvas = document.querySelector("#sourcePdfCanvas");
-  const urls = materialReaderUrls(material);
-  if (!status || !canvas || !urls.length) return;
-  try {
-    status.textContent = "平台内 PDF 预览已显示；正在加载 PDF.js canvas 增强阅读器...";
-    const pdfjs = await loadPdfJs();
-    let loaded = null;
-    let loadedUrl = "";
-    let lastError = null;
-    for (const url of urls) {
-      try {
-        loaded = await pdfjs.getDocument({ url }).promise;
-        loadedUrl = url;
-        break;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    if (!loaded) throw lastError || new Error("PDF 加载失败");
-    if (state.sourceReader.pdfUrl !== loadedUrl) {
-      state.sourceReader.page = 1;
-      state.sourceReader.scale = 1.05;
-      state.sourceReader.pdfUrl = loadedUrl;
-    }
-    state.sourceReader.pdf = loaded;
-    document.querySelector("#pdfPageCount").textContent = String(state.sourceReader.pdf.numPages);
-    await renderPdfPage();
-  } catch (error) {
-    status.innerHTML = `PDF.js 增强阅读器加载失败：${escapeHtml(readableError(error))}。下方基础 PDF 预览仍可继续阅读。`;
+  const images = Array.isArray(material.page_images) ? material.page_images : [];
+  state.sourceReader.pdfImages = images;
+  state.sourceReader.page = images.length ? 1 : 0;
+  state.sourceReader.scale = 1;
+  document.querySelector("#pdfPageCount").textContent = String(images.length);
+  if (!images.length) {
+    if (status) status.textContent = "PDF 未自动加载；等待构建产物生成图片页。";
+    return;
   }
+  await renderPdfPage();
 }
 
 async function renderPdfPage() {
-  const pdf = state.sourceReader.pdf;
-  const canvas = document.querySelector("#sourcePdfCanvas");
+  const images = state.sourceReader.pdfImages || [];
+  const slide = document.querySelector("#pdfSlideImage");
   const status = document.querySelector("#pdfReaderStatus");
-  if (!pdf || !canvas || !status) return;
-  const pageNumber = Math.max(1, Math.min(pdf.numPages, state.sourceReader.page));
+  if (!slide || !status || !images.length) return;
+  const pageNumber = Math.max(1, Math.min(images.length, state.sourceReader.page || 1));
   state.sourceReader.page = pageNumber;
-  status.textContent = `正在渲染第 ${pageNumber} 页...`;
-
-  const page = await pdf.getPage(pageNumber);
-  const baseViewport = page.getViewport({ scale: 1 });
-  const wrap = canvas.closest(".pdf-canvas-wrap");
-  const fitScale = Math.max(0.6, Math.min(1.7, ((wrap?.clientWidth || 900) - 36) / baseViewport.width));
-  const viewport = page.getViewport({ scale: fitScale * state.sourceReader.scale });
-  const context = canvas.getContext("2d");
-  canvas.width = Math.floor(viewport.width);
-  canvas.height = Math.floor(viewport.height);
-  canvas.style.width = `${Math.floor(viewport.width)}px`;
-  canvas.style.height = `${Math.floor(viewport.height)}px`;
-  if (state.sourceReader.renderTask) {
-    try {
-      state.sourceReader.renderTask.cancel();
-    } catch {
-      // A completed PDF.js render task can be ignored.
-    }
-  }
-  const renderTask = page.render({ canvasContext: context, viewport });
-  state.sourceReader.renderTask = renderTask;
-  await renderTask.promise;
-  status.textContent = `第 ${pageNumber} 页 / 共 ${pdf.numPages} 页`;
-  document.querySelector(".pdf-reader")?.classList.add("pdf-enhanced");
+  const imageUrl = images[pageNumber - 1];
+  const zoomPercent = Math.round(state.sourceReader.scale * 100);
+  slide.alt = `幻灯片第 ${pageNumber} 页`;
+  slide.src = imageUrl;
+  slide.style.width = `${zoomPercent}%`;
+  slide.style.maxWidth = state.sourceReader.scale <= 1 ? "100%" : "none";
+  status.textContent = `第 ${pageNumber} 页 / 共 ${images.length} 页，缩放 ${zoomPercent}%`;
   document.querySelector("#pdfPageNumber").textContent = String(pageNumber);
-  document.querySelector("#pdfPageCount").textContent = String(pdf.numPages);
+  document.querySelector("#pdfPageCount").textContent = String(images.length);
 }
 
 async function changePdfPage(delta) {
-  if (!state.sourceReader.pdf) return;
-  state.sourceReader.page = Math.max(1, Math.min(state.sourceReader.pdf.numPages, state.sourceReader.page + delta));
+  const images = state.sourceReader.pdfImages || [];
+  if (!images.length) return;
+  state.sourceReader.page = Math.max(1, Math.min(images.length, state.sourceReader.page + delta));
   await renderPdfPage();
 }
 
 async function setPdfZoom(delta) {
-  state.sourceReader.scale = Math.max(0.7, Math.min(1.8, state.sourceReader.scale + delta));
+  if (!state.sourceReader.pdfImages?.length) return;
+  state.sourceReader.scale = Math.max(0.65, Math.min(1.9, state.sourceReader.scale + delta));
   await renderPdfPage();
 }
 

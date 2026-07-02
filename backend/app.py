@@ -8,6 +8,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
+DIST = ROOT / "dist"
 sys.path.insert(0, str(ROOT))
 
 from backend.content import (  # noqa: E402
@@ -57,7 +58,7 @@ class LearningAppHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/curriculum":
-            self.json_response(curriculum())
+            self.json_response(curriculum_with_static_materials())
             return
 
         if path == "/api/state":
@@ -65,27 +66,27 @@ class LearningAppHandler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/dashboard":
-            self.json_response(dashboard(curriculum()))
+            self.json_response(dashboard(curriculum_with_static_materials()))
             return
 
         if path == "/api/learning-model":
-            self.json_response(learning_model(curriculum()))
+            self.json_response(learning_model(curriculum_with_static_materials()))
             return
 
         if path == "/api/mastery-report":
-            self.json_response(mastery_report(curriculum()))
+            self.json_response(mastery_report(curriculum_with_static_materials()))
             return
 
         if path == "/api/study-plan":
-            self.json_response(study_plan(curriculum()))
+            self.json_response(study_plan(curriculum_with_static_materials()))
             return
 
         if path == "/api/next-actions":
-            self.json_response({"actions": compute_next_actions(curriculum())})
+            self.json_response({"actions": compute_next_actions(curriculum_with_static_materials())})
             return
 
         if path == "/api/review-queue":
-            self.json_response({"reviews": review_queue(curriculum())})
+            self.json_response({"reviews": review_queue(curriculum_with_static_materials())})
             return
 
         if path.startswith("/api/lessons/"):
@@ -239,6 +240,15 @@ class LearningAppHandler(SimpleHTTPRequestHandler):
     def serve_static(self, path):
         if path in ("", "/"):
             target = FRONTEND / "index.html"
+        elif path.startswith("/data/"):
+            requested = (DIST / path.lstrip("/")).resolve()
+            if not str(requested).startswith(str(DIST.resolve())):
+                self.send_error(403)
+                return
+            target = requested
+            if not target.exists():
+                self.send_error(404)
+                return
         else:
             requested = (FRONTEND / path.lstrip("/")).resolve()
             if not str(requested).startswith(str(FRONTEND.resolve())):
@@ -279,6 +289,32 @@ def searchable_text(lesson):
         " ".join(item.get("name", "") + " " + item.get("formula", "") for item in lesson.get("math", [])),
     ]
     return " ".join(parts).lower()
+
+
+def curriculum_with_static_materials():
+    data = curriculum()
+    static_curriculum = DIST / "data" / "curriculum.json"
+    if not static_curriculum.exists():
+        return data
+    try:
+        static_data = json.loads(static_curriculum.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return data
+
+    static_by_id = {lesson.get("id"): lesson for lesson in static_data.get("lessons", [])}
+    for lesson in data.get("lessons", []):
+        static_material = static_by_id.get(lesson.get("id"), {}).get("official_material", {})
+        page_images = static_material.get("page_images")
+        if not page_images:
+            continue
+        lesson.setdefault("official_material", {}).update(
+            {
+                "page_images": page_images,
+                "page_count": static_material.get("page_count", len(page_images)),
+                "reader_mode": static_material.get("reader_mode", "image-deck"),
+            }
+        )
+    return data
 
 
 def make_explanation(lessons):

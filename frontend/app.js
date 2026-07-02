@@ -1,6 +1,7 @@
 const STATIC_CURRICULUM_URL = "data/curriculum.json";
 const LOCAL_STATE_KEY = "cs336.learning_state.v2";
-const CONFIG = globalThis.CS336_CONFIG || {};
+const LOCAL_CONFIG_KEY = "cs336.cloud_config.v1";
+let CONFIG = loadAppConfig();
 
 const state = {
   data: null,
@@ -27,6 +28,15 @@ const state = {
     lastSync: "",
     message: "",
     error: "",
+  },
+  sourceReader: {
+    pdfjs: null,
+    pdf: null,
+    pdfUrl: "",
+    page: 1,
+    scale: 1.05,
+    renderTask: null,
+    traceEntries: [],
   },
   quizSelections: {},
 };
@@ -64,6 +74,32 @@ const els = {
 };
 
 init();
+
+function loadAppConfig() {
+  const base = globalThis.CS336_CONFIG || {};
+  let local = {};
+  try {
+    local = JSON.parse(localStorage.getItem(LOCAL_CONFIG_KEY) || "{}");
+  } catch {
+    local = {};
+  }
+  return {
+    ...base,
+    ...Object.fromEntries(Object.entries(local).filter(([, value]) => String(value || "").trim())),
+    supabaseModuleUrl: local.supabaseModuleUrl || base.supabaseModuleUrl || "https://esm.sh/@supabase/supabase-js@2",
+    pdfJsModuleUrl: local.pdfJsModuleUrl || base.pdfJsModuleUrl || "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs",
+    pdfJsWorkerUrl: local.pdfJsWorkerUrl || base.pdfJsWorkerUrl || "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs",
+  };
+}
+
+function hasLocalCloudConfig() {
+  try {
+    const local = JSON.parse(localStorage.getItem(LOCAL_CONFIG_KEY) || "{}");
+    return Boolean(local.supabaseUrl || local.supabaseAnonKey || local.supabaseAuthRedirectUrl);
+  } catch {
+    return false;
+  }
+}
 
 async function init() {
   const [course, dashboard, serverState, model, report, plan] = await Promise.all([
@@ -249,8 +285,11 @@ async function staticPost(name, payload) {
 }
 
 async function initCloud() {
+  CONFIG = loadAppConfig();
   state.cloud.configured = Boolean(CONFIG.supabaseUrl && CONFIG.supabaseAnonKey);
   state.cloud.loading = true;
+  state.cloud.client = null;
+  state.cloud.user = null;
   state.cloud.message = "";
   state.cloud.error = "";
   if (!state.cloud.configured) {
@@ -1149,7 +1188,7 @@ function renderSource(lesson) {
   const material = lesson.official_material || {
     label: "官方课程页面",
     url: lesson.official_source,
-    embed_url: "",
+    reader_url: "",
     download_url: lesson.official_source,
     kind: "schedule",
     usage_steps: [],
@@ -1157,21 +1196,6 @@ function renderSource(lesson) {
     explanation_prompts: [],
   };
   const primaryMath = lesson.math?.[0];
-  const materialFrame = material.embed_url
-    ? `
-      <iframe
-        class="material-frame"
-        src="${escapeHtml(material.embed_url)}"
-        title="${escapeHtml(lesson.lecture)} 官方材料"
-        loading="lazy"
-      ></iframe>
-    `
-    : `
-      <div class="material-placeholder">
-        <strong>这讲没有可嵌入的官方讲义。</strong>
-        <p>请使用下方按钮打开 CS336 官方课程页面，并按本页的阅读流程记录笔记。</p>
-      </div>
-    `;
 
   els.lessonBody.innerHTML = `
     <div class="content-grid source-layout">
@@ -1190,8 +1214,8 @@ function renderSource(lesson) {
             }
           </div>
         </div>
-        ${materialFrame}
-        <p class="source-disclaimer">官方材料来自 Stanford CS336 页面或其官方 GitHub 讲义链接。本平台只做嵌入、跳转和中文学习拆解；事实边界以官方材料为准。</p>
+        ${sourceReaderMarkup(lesson, material)}
+        <p class="source-disclaimer">官方材料来自 Stanford CS336 页面或其官方 GitHub 讲义链接。本平台在浏览器中读取公开材料并做学习化呈现；事实边界以官方材料为准。</p>
       </section>
 
       <section class="source-guidance-grid">
@@ -1238,6 +1262,390 @@ function renderSource(lesson) {
       </section>
     </div>
   `;
+  queueMicrotask(() => initSourceReader(lesson, material));
+  window.setTimeout(() => {
+    if (document.querySelector("#traceReaderStatus")?.textContent.includes("加载") || document.querySelector("#pdfReaderStatus")?.textContent.includes("加载")) {
+      initSourceReader(lesson, material);
+    }
+  }, 0);
+}
+
+function sourceReaderMarkup(lesson, material) {
+  if (material.kind === "slides-pdf") {
+    const pdfUrl = material.local_reader_url || material.reader_url || material.download_url || "";
+    const pdfObjectUrl = material.reader_url || material.download_url || material.local_reader_url || "";
+    return `
+      <div class="pdf-reader" data-pdf-url="${escapeHtml(pdfUrl)}">
+        <div class="reader-toolbar">
+          <div>
+            <button class="icon-button reader-button" type="button" data-pdf-action="prev" aria-label="上一页">‹</button>
+            <span class="reader-page-state"><span id="pdfPageNumber">1</span> / <span id="pdfPageCount">?</span></span>
+            <button class="icon-button reader-button" type="button" data-pdf-action="next" aria-label="下一页">›</button>
+          </div>
+          <div>
+            <button class="ghost-button" type="button" data-pdf-action="zoom-out">缩小</button>
+            <button class="ghost-button" type="button" data-pdf-action="zoom-in">放大</button>
+          </div>
+        </div>
+        <div id="pdfReaderStatus" class="reader-status">下方是平台内 PDF 预览；PDF.js canvas 阅读器正在作为增强层加载。</div>
+        <object id="pdfObjectFallback" class="pdf-object" data="${escapeHtml(pdfObjectUrl)}" type="application/pdf">
+          <p>当前浏览器无法内嵌 PDF。请使用上方官方材料链接，并把阅读笔记记录在本平台。</p>
+        </object>
+        <div class="pdf-canvas-wrap">
+          <canvas id="sourcePdfCanvas" aria-label="${escapeHtml(lesson.lecture)} PDF 幻灯片"></canvas>
+        </div>
+      </div>
+    `;
+  }
+
+  if (material.kind === "lecture-trace") {
+    return `
+      <div class="trace-reader" data-trace-url="${escapeHtml(material.local_reader_url || material.source_text_url || material.reader_url || "")}">
+        <div class="reader-toolbar">
+          <div class="segmented-control" aria-label="讲义视图">
+            <button class="active" type="button" data-trace-mode="lecture">讲义</button>
+            <button type="button" data-trace-mode="images">图片</button>
+            <button type="button" data-trace-mode="source">源码</button>
+          </div>
+          <span id="traceReaderStatus" class="reader-status compact">正在加载官方 Python 讲义...</span>
+        </div>
+        <div id="traceReaderBody" class="trace-reader-body"></div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="material-placeholder">
+      <strong>这讲没有单独可读取的官方材料。</strong>
+      <p>请使用上方按钮打开 CS336 官方课程页面，并在本平台记录学习证据。</p>
+    </div>
+  `;
+}
+
+async function initSourceReader(lesson, material) {
+  if (material.kind === "slides-pdf") {
+    await initPdfReader(material);
+  }
+  if (material.kind === "lecture-trace") {
+    await initTraceReader(lesson, material);
+  }
+}
+
+async function loadPdfJs() {
+  if (state.sourceReader.pdfjs) return state.sourceReader.pdfjs;
+  const pdfjs = await import(CONFIG.pdfJsModuleUrl || "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs");
+  pdfjs.GlobalWorkerOptions.workerSrc = CONFIG.pdfJsWorkerUrl || "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs";
+  state.sourceReader.pdfjs = pdfjs;
+  return pdfjs;
+}
+
+async function initPdfReader(material) {
+  const status = document.querySelector("#pdfReaderStatus");
+  const canvas = document.querySelector("#sourcePdfCanvas");
+  const urls = materialReaderUrls(material);
+  if (!status || !canvas || !urls.length) return;
+  try {
+    status.textContent = "平台内 PDF 预览已显示；正在加载 PDF.js canvas 增强阅读器...";
+    const pdfjs = await loadPdfJs();
+    let loaded = null;
+    let loadedUrl = "";
+    let lastError = null;
+    for (const url of urls) {
+      try {
+        loaded = await pdfjs.getDocument({ url }).promise;
+        loadedUrl = url;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!loaded) throw lastError || new Error("PDF 加载失败");
+    if (state.sourceReader.pdfUrl !== loadedUrl) {
+      state.sourceReader.page = 1;
+      state.sourceReader.scale = 1.05;
+      state.sourceReader.pdfUrl = loadedUrl;
+    }
+    state.sourceReader.pdf = loaded;
+    document.querySelector("#pdfPageCount").textContent = String(state.sourceReader.pdf.numPages);
+    await renderPdfPage();
+  } catch (error) {
+    status.innerHTML = `PDF.js 增强阅读器加载失败：${escapeHtml(readableError(error))}。下方基础 PDF 预览仍可继续阅读。`;
+  }
+}
+
+async function renderPdfPage() {
+  const pdf = state.sourceReader.pdf;
+  const canvas = document.querySelector("#sourcePdfCanvas");
+  const status = document.querySelector("#pdfReaderStatus");
+  if (!pdf || !canvas || !status) return;
+  const pageNumber = Math.max(1, Math.min(pdf.numPages, state.sourceReader.page));
+  state.sourceReader.page = pageNumber;
+  status.textContent = `正在渲染第 ${pageNumber} 页...`;
+
+  const page = await pdf.getPage(pageNumber);
+  const baseViewport = page.getViewport({ scale: 1 });
+  const wrap = canvas.closest(".pdf-canvas-wrap");
+  const fitScale = Math.max(0.6, Math.min(1.7, ((wrap?.clientWidth || 900) - 36) / baseViewport.width));
+  const viewport = page.getViewport({ scale: fitScale * state.sourceReader.scale });
+  const context = canvas.getContext("2d");
+  canvas.width = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+  canvas.style.width = `${Math.floor(viewport.width)}px`;
+  canvas.style.height = `${Math.floor(viewport.height)}px`;
+  if (state.sourceReader.renderTask) {
+    try {
+      state.sourceReader.renderTask.cancel();
+    } catch {
+      // A completed PDF.js render task can be ignored.
+    }
+  }
+  const renderTask = page.render({ canvasContext: context, viewport });
+  state.sourceReader.renderTask = renderTask;
+  await renderTask.promise;
+  status.textContent = `第 ${pageNumber} 页 / 共 ${pdf.numPages} 页`;
+  document.querySelector(".pdf-reader")?.classList.add("pdf-enhanced");
+  document.querySelector("#pdfPageNumber").textContent = String(pageNumber);
+  document.querySelector("#pdfPageCount").textContent = String(pdf.numPages);
+}
+
+async function changePdfPage(delta) {
+  if (!state.sourceReader.pdf) return;
+  state.sourceReader.page = Math.max(1, Math.min(state.sourceReader.pdf.numPages, state.sourceReader.page + delta));
+  await renderPdfPage();
+}
+
+async function setPdfZoom(delta) {
+  state.sourceReader.scale = Math.max(0.7, Math.min(1.8, state.sourceReader.scale + delta));
+  await renderPdfPage();
+}
+
+async function initTraceReader(lesson, material) {
+  const status = document.querySelector("#traceReaderStatus");
+  const body = document.querySelector("#traceReaderBody");
+  const urls = materialReaderUrls(material);
+  if (!status || !body || !urls.length) return;
+  try {
+    status.textContent = "正在读取官方 Python 讲义...";
+    const source = await fetchTextWithFallback(urls);
+    const parsed = parseLectureTraceSource(source, material);
+    state.sourceReader.traceEntries = parsed.entries;
+    state.sourceReader.traceSource = source;
+    state.sourceReader.traceMeta = parsed.meta;
+    renderTraceMode("lecture", lesson);
+  } catch (error) {
+    body.innerHTML = `
+      <div class="material-placeholder">
+        <strong>官方 Python 讲义加载失败。</strong>
+        <p>${escapeHtml(readableError(error))}</p>
+      </div>
+    `;
+    status.textContent = "加载失败";
+  }
+}
+
+function materialReaderUrls(material) {
+  return [...new Set([material.local_reader_url, material.reader_url, material.source_text_url, material.download_url].filter(Boolean))];
+}
+
+async function fetchTextWithFallback(urls) {
+  let lastError = null;
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, { cache: "force-cache" });
+      if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+      return response.text();
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("无法读取官方讲义源文件");
+}
+
+function parseLectureTraceSource(source, material) {
+  const entries = [];
+  const codeLines = [];
+  const mainOrder = parseMainCallOrder(source);
+  const definitionOrder = new Map();
+  let currentSection = "Lecture";
+  source.split("\n").forEach((line, index) => {
+    const lineNo = index + 1;
+    const defMatch = line.match(/^def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    const classMatch = line.match(/^class\s+([A-Za-z_][A-Za-z0-9_]*)/);
+    if (defMatch || classMatch) {
+      currentSection = defMatch?.[1] || classMatch?.[1] || currentSection;
+      if (!definitionOrder.has(currentSection)) definitionOrder.set(currentSection, definitionOrder.size);
+      codeLines.push({ line: lineNo, code: line });
+    }
+    if (line.includes("@inspect") || line.includes("@stepover")) codeLines.push({ line: lineNo, code: line.trim() });
+
+    const textValue = extractStringCall(line, "text");
+    if (textValue) entries.push({ type: "text", text: textValue, section: currentSection, line: lineNo });
+
+    const imageValue = extractImageCall(line, material);
+    if (imageValue) entries.push({ type: "image", section: currentSection, line: lineNo, ...imageValue });
+
+    const linkValue = extractLinkCall(line);
+    if (linkValue) entries.push({ type: "link", section: currentSection, line: lineNo, ...linkValue });
+  });
+  entries.sort((left, right) => traceEntryRank(left, mainOrder, definitionOrder) - traceEntryRank(right, mainOrder, definitionOrder) || left.line - right.line);
+  return {
+    entries,
+    meta: {
+      textCount: entries.filter((entry) => entry.type === "text").length,
+      imageCount: entries.filter((entry) => entry.type === "image").length,
+      linkCount: entries.filter((entry) => entry.type === "link").length,
+      codeLines,
+    },
+  };
+}
+
+function parseMainCallOrder(source) {
+  const calls = [];
+  let inMain = false;
+  source.split("\n").forEach((line) => {
+    if (line.startsWith("def main(")) {
+      inMain = true;
+      return;
+    }
+    if (inMain && /^def\s+/.test(line)) inMain = false;
+    if (!inMain) return;
+    const call = line.match(/^\s{4}([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    if (call && !["text", "image", "link"].includes(call[1])) calls.push(call[1]);
+  });
+  return new Map(calls.map((name, index) => [name, index]));
+}
+
+function traceEntryRank(entry, mainOrder, definitionOrder) {
+  if (mainOrder.has(entry.section)) return mainOrder.get(entry.section);
+  if (entry.section === "main") return 10000;
+  return 100 + (definitionOrder.get(entry.section) ?? 9000);
+}
+
+function extractStringCall(line, name) {
+  const marker = `${name}(`;
+  const start = line.indexOf(marker);
+  if (start < 0) return "";
+  return extractFirstString(line.slice(start + marker.length));
+}
+
+function extractFirstString(text) {
+  const quoteIndex = text.search(/["']/);
+  if (quoteIndex < 0) return "";
+  const quote = text[quoteIndex];
+  let output = "";
+  let escaped = false;
+  for (let i = quoteIndex + 1; i < text.length; i += 1) {
+    const char = text[i];
+    if (escaped) {
+      output += char === "n" ? "\n" : char;
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (char === quote) {
+      return output;
+    } else {
+      output += char;
+    }
+  }
+  return output;
+}
+
+function extractImageCall(line, material) {
+  const src = extractStringCall(line, "image");
+  if (!src) return null;
+  const widthMatch = line.match(/width\s*=\s*(\d+)/);
+  return {
+    src: resolveMaterialUrl(src, material),
+    originalSrc: src,
+    width: widthMatch ? Number(widthMatch[1]) : 640,
+  };
+}
+
+function extractLinkCall(line) {
+  if (!/\b(link|article_link|post_link|video_link)\s*\(/.test(line)) return null;
+  const urlMatch = line.match(/url\s*=\s*["']([^"']+)["']/) || line.match(/\b(?:link|article_link|post_link|video_link)\s*\(\s*["']([^"']+)["']/);
+  const titleMatch = line.match(/title\s*=\s*["']([^"']+)["']/);
+  if (!urlMatch) return null;
+  return {
+    url: urlMatch[1],
+    title: titleMatch?.[1] || compactUrlLabel(urlMatch[1]),
+  };
+}
+
+function resolveMaterialUrl(src, material) {
+  if (/^https?:\/\//.test(src)) return src;
+  return `${material.asset_base_url || ""}${src}`;
+}
+
+function compactUrlLabel(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+function renderTraceMode(mode, lesson) {
+  const body = document.querySelector("#traceReaderBody");
+  const status = document.querySelector("#traceReaderStatus");
+  if (!body) return;
+  document.querySelectorAll("[data-trace-mode]").forEach((button) => button.classList.toggle("active", button.dataset.traceMode === mode));
+  const entries = state.sourceReader.traceEntries || [];
+  const meta = state.sourceReader.traceMeta || { textCount: 0, imageCount: 0, linkCount: 0, codeLines: [] };
+  if (status) status.textContent = `${meta.textCount} 段讲义 · ${meta.imageCount} 张图 · ${meta.codeLines.length} 个代码锚点`;
+
+  if (mode === "source") {
+    body.innerHTML = `
+      <div class="trace-summary">
+        <strong>${escapeHtml(lesson.lecture)} 官方 Python 源码</strong>
+        <span>用于对照 executable lecture 的真实结构；学习时优先看“讲义”视图。</span>
+      </div>
+      ${codePanel(state.sourceReader.traceSource || "", "python", "官方 lecture 源码")}
+    `;
+    return;
+  }
+
+  const filtered = mode === "images" ? entries.filter((entry) => entry.type === "image") : entries.filter((entry) => entry.type !== "link");
+  body.innerHTML = `
+    <div class="trace-summary">
+      <strong>${escapeHtml(lesson.lecture)} 平台内讲义阅读器</strong>
+      <span>从官方 Python trace 提取 text/image/code 标注，保留原始材料结构，并加入可读版排版。</span>
+    </div>
+    <div class="trace-entry-list">
+      ${filtered.length ? filtered.map((entry) => traceEntryMarkup(entry)).join("") : `<p class="small-text">这个视图没有可展示内容。</p>`}
+    </div>
+  `;
+}
+
+function traceEntryMarkup(entry) {
+  if (entry.type === "image") {
+    return `
+      <figure class="trace-image-card">
+        <img src="${escapeHtml(entry.src)}" alt="${escapeHtml(entry.originalSrc)}" loading="lazy" style="max-width: ${Math.min(100, Math.round((entry.width || 640) / 8))}%;" />
+        <figcaption>${escapeHtml(entry.section)} · line ${entry.line} · ${escapeHtml(entry.originalSrc)}</figcaption>
+      </figure>
+    `;
+  }
+  const text = entry.text || "";
+  const heading = text.match(/^(#{1,4})\s+(.+)/);
+  if (heading) {
+    const level = Math.min(4, heading[1].length + 2);
+    return `<article class="trace-heading-card"><h${level}>${markdownLite(heading[2])}</h${level}><span>${escapeHtml(entry.section)} · line ${entry.line}</span></article>`;
+  }
+  const bullet = text.match(/^[-*]\s+(.+)/);
+  if (bullet) {
+    return `<article class="trace-text-card bullet"><span aria-hidden="true">•</span><p>${markdownLite(bullet[1])}</p></article>`;
+  }
+  return `<article class="trace-text-card"><p>${markdownLite(text)}</p><span>${escapeHtml(entry.section)} · line ${entry.line}</span></article>`;
+}
+
+function markdownLite(value) {
+  let html = escapeHtml(value);
+  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, (_match, label, url) => `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`);
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  return html;
 }
 
 function renderMath(lesson) {
@@ -1517,23 +1925,14 @@ function accountMarkup(context) {
         <strong>本机学习档案</strong>
         <span>云登录未配置，当前浏览器会继续保存学习进度。</span>
       </div>
-      <p class="small-text">你现在仍可完整学习、提交证据、做测验和记录复习。要启用个人账号与跨设备同步，需要给 GitHub Pages 注入 Supabase URL 和 Anon Key。</p>
+      <p class="small-text">你现在仍可完整学习、提交证据、做测验和记录复习。要启用个人账号与跨设备同步，需要连接 Supabase Auth 和 Supabase Postgres。</p>
       <div class="cloud-facts">
         <span>离线可用</span>
         <span>本机保存</span>
-        <span>登录待配置</span>
+        <span>${hasLocalCloudConfig() ? "本机配置未完整" : "登录待配置"}</span>
       </div>
-      <div class="account-login-disabled">
-        <label class="account-field" for="accountEmail-${escapeHtml(context)}">
-          <span>邮箱登录</span>
-          <input id="accountEmail-${escapeHtml(context)}" type="email" placeholder="配置云同步后启用" disabled />
-        </label>
-        <div class="account-actions">
-          <button class="secondary-button" type="button" disabled>发送登录邮件</button>
-          <button class="ghost-button" type="button" disabled>GitHub 登录</button>
-        </div>
-      </div>
-      <p class="cloud-message warning">登录入口已在这里；当前部署还没有 Supabase 配置，所以暂时只能使用本机模式。</p>
+      ${cloudSetupMarkup(context)}
+      <p class="cloud-message warning">当前没有完整 Supabase 配置，所以暂时只能使用本机模式。保存完整配置后，这里会直接变成登录表单。</p>
     `;
   }
 
@@ -1594,6 +1993,145 @@ function closeAccountModal() {
   els.accountModal.hidden = true;
   document.body.classList.remove("modal-open");
   els.accountOpen?.focus();
+}
+
+function cloudSetupMarkup(context) {
+  const redirectUrl = CONFIG.supabaseAuthRedirectUrl || location.href.split("#")[0].split("?")[0];
+  const repo = "SteinsHead/cs336-learning-platform";
+  const ghCommands = [
+    `gh variable set SUPABASE_URL --repo ${repo} --body "https://<project-ref>.supabase.co"`,
+    `gh variable set SUPABASE_ANON_KEY --repo ${repo} --body "<anon-public-key>"`,
+    `gh variable set SUPABASE_AUTH_REDIRECT_URL --repo ${repo} --body "https://steinshead.github.io/cs336-learning-platform/"`,
+    `gh workflow run pages.yml --repo ${repo}`,
+  ].join("\n");
+  const sql = [
+    "create table if not exists public.learning_states (",
+    "  user_id uuid primary key references auth.users(id) on delete cascade,",
+    "  state jsonb not null,",
+    "  updated_at timestamptz not null default now()",
+    ");",
+    "",
+    "alter table public.learning_states enable row level security;",
+    "",
+    'create policy "Users can read their own learning state"',
+    "on public.learning_states for select to authenticated",
+    "using (auth.uid() = user_id);",
+    "",
+    'create policy "Users can insert their own learning state"',
+    "on public.learning_states for insert to authenticated",
+    "with check (auth.uid() = user_id);",
+    "",
+    'create policy "Users can update their own learning state"',
+    "on public.learning_states for update to authenticated",
+    "using (auth.uid() = user_id)",
+    "with check (auth.uid() = user_id);",
+  ].join("\n");
+
+  return `
+    <section class="account-setup">
+      <div class="setup-head">
+        <div>
+          <strong>账号配置向导</strong>
+          <p>Supabase 的 anon key 是浏览器公开 key；真正的数据隔离依赖下面的 RLS 策略。</p>
+        </div>
+        <span>${hasLocalCloudConfig() ? "已保存本机配置" : "未配置"}</span>
+      </div>
+      <div class="setup-steps">
+        <article>
+          <span>1</span>
+          <div>
+            <strong>创建 Supabase 项目并执行 SQL</strong>
+            <p>在 Supabase SQL Editor 运行下面的表结构和 RLS 策略。</p>
+            ${copySnippet("复制 Supabase SQL", sql)}
+          </div>
+        </article>
+        <article>
+          <span>2</span>
+          <div>
+            <strong>配置 Auth Redirect</strong>
+            <p>在 Supabase Authentication -> URL Configuration 添加站点地址和 Redirect URL。</p>
+            ${copySnippet("复制 Redirect URL", redirectUrl)}
+          </div>
+        </article>
+        <article>
+          <span>3</span>
+          <div>
+            <strong>当前浏览器立即启用登录</strong>
+            <p>填入 Project URL 和 anon public key 后保存，本页面会重新初始化登录模块。</p>
+            <label class="account-field" for="runtimeSupabaseUrl-${escapeHtml(context)}">
+              <span>Supabase Project URL</span>
+              <input id="runtimeSupabaseUrl-${escapeHtml(context)}" data-runtime-config="supabaseUrl" type="text" placeholder="https://<project-ref>.supabase.co" value="${escapeHtml(CONFIG.supabaseUrl || "")}" />
+            </label>
+            <label class="account-field" for="runtimeSupabaseAnonKey-${escapeHtml(context)}">
+              <span>Supabase Anon Public Key</span>
+              <input id="runtimeSupabaseAnonKey-${escapeHtml(context)}" data-runtime-config="supabaseAnonKey" type="text" placeholder="eyJhbGciOi..." value="${escapeHtml(CONFIG.supabaseAnonKey || "")}" />
+            </label>
+            <label class="account-field" for="runtimeRedirectUrl-${escapeHtml(context)}">
+              <span>Auth Redirect URL</span>
+              <input id="runtimeRedirectUrl-${escapeHtml(context)}" data-runtime-config="supabaseAuthRedirectUrl" type="text" value="${escapeHtml(redirectUrl)}" />
+            </label>
+            <div class="account-actions">
+              <button class="secondary-button" type="button" data-account-config-action="save">保存本机配置并启用</button>
+              <button class="ghost-button" type="button" data-account-config-action="clear">清除本机配置</button>
+            </div>
+          </div>
+        </article>
+        <article>
+          <span>4</span>
+          <div>
+            <strong>发布为全站配置</strong>
+            <p>要让所有设备都自动看到登录入口，在 GitHub 仓库 Variables 中设置同样的值，或复制下面的命令。</p>
+            ${copySnippet("复制 GitHub Variables 命令", ghCommands)}
+          </div>
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function copySnippet(label, code) {
+  const copyId = registerCopyPayload(code);
+  return `
+    <div class="setup-snippet">
+      <div class="source-header">
+        <span>${escapeHtml(label)}</span>
+        <button class="copy-button compact" type="button" data-copy-id="${copyId}" aria-label="${escapeHtml(label)}">
+          <span aria-hidden="true">⧉</span>
+          <span>复制</span>
+        </button>
+      </div>
+      <code>${escapeHtml(code)}</code>
+    </div>
+  `;
+}
+
+async function saveRuntimeCloudConfig(trigger) {
+  const scope = trigger?.closest(".account-stack") || document;
+  const nextConfig = {};
+  scope.querySelectorAll("[data-runtime-config]").forEach((input) => {
+    nextConfig[input.dataset.runtimeConfig] = input.value.trim();
+  });
+  if (!nextConfig.supabaseUrl || !nextConfig.supabaseAnonKey) {
+    state.cloud.error = "请至少填写 Supabase Project URL 和 Anon Public Key。";
+    renderAccountPanel();
+    return;
+  }
+  localStorage.setItem(LOCAL_CONFIG_KEY, JSON.stringify(nextConfig));
+  state.cloud.message = "已保存本机 Supabase 配置，正在重新初始化登录模块。";
+  await restartCloud();
+}
+
+async function clearRuntimeCloudConfig() {
+  localStorage.removeItem(LOCAL_CONFIG_KEY);
+  state.cloud.message = "已清除本机账号配置。";
+  await restartCloud();
+}
+
+async function restartCloud() {
+  await initCloud();
+  await hydrateCloudState();
+  await refreshLearningState(false);
+  renderAccountPanel();
 }
 
 function cloudBadgeText() {
@@ -2256,6 +2794,29 @@ function registerCopyPayload(text) {
 }
 
 async function handleCopyClick(event) {
+  const pdfAction = event.target.closest("[data-pdf-action]");
+  if (pdfAction) {
+    const action = pdfAction.dataset.pdfAction;
+    if (action === "prev") await changePdfPage(-1);
+    if (action === "next") await changePdfPage(1);
+    if (action === "zoom-out") await setPdfZoom(-0.15);
+    if (action === "zoom-in") await setPdfZoom(0.15);
+    return;
+  }
+
+  const traceMode = event.target.closest("[data-trace-mode]");
+  if (traceMode) {
+    renderTraceMode(traceMode.dataset.traceMode, getCurrentLesson());
+    return;
+  }
+
+  const accountConfigAction = event.target.closest("[data-account-config-action]");
+  if (accountConfigAction) {
+    if (accountConfigAction.dataset.accountConfigAction === "save") await saveRuntimeCloudConfig(accountConfigAction);
+    if (accountConfigAction.dataset.accountConfigAction === "clear") await clearRuntimeCloudConfig();
+    return;
+  }
+
   const cloudAction = event.target.closest("[data-cloud-action]");
   if (cloudAction) {
     if (cloudAction.dataset.cloudAction === "magic") await sendMagicLink(cloudAction);

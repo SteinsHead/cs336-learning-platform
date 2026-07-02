@@ -223,27 +223,47 @@ def raw_github_material_url(url):
     return url
 
 
+def trace_source_url(url):
+    if "trace=lecture_" not in url:
+        return ""
+    lecture_id = url.split("trace=", 1)[1].split("&", 1)[0]
+    return f"https://raw.githubusercontent.com/stanford-cs336/lectures/main/{lecture_id}.py"
+
+
+def local_material_url(remote_url):
+    if not remote_url:
+        return ""
+    filename = remote_url.rstrip("/").split("/")[-1]
+    if not filename:
+        return ""
+    return f"data/lectures/{filename}"
+
+
 def official_material_for(lesson):
     url = LESSON_SOURCE_URLS.get(lesson["id"], SOURCE_MAP["schedule"]["url"])
     material_url = raw_github_material_url(url)
+    source_text_url = trace_source_url(url)
     if url.endswith(".pdf"):
         kind = "slides-pdf"
         label = "官方 PDF 幻灯片"
-        embed_url = material_url
+        reader_url = material_url
     elif "trace=lecture_" in url:
         kind = "lecture-trace"
-        label = "官方 lecture trace"
-        embed_url = url
+        label = "官方可执行讲义"
+        reader_url = source_text_url
     else:
         kind = "schedule"
         label = "官方课程页面"
-        embed_url = ""
+        reader_url = ""
 
     return {
         "kind": kind,
         "label": label,
         "url": url,
-        "embed_url": embed_url,
+        "reader_url": reader_url,
+        "local_reader_url": local_material_url(reader_url),
+        "source_text_url": source_text_url,
+        "asset_base_url": "https://raw.githubusercontent.com/stanford-cs336/lectures/main/",
         "download_url": material_url,
         "source_label": "Stanford CS336 official course materials",
         "usage_steps": [

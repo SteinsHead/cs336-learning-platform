@@ -69,7 +69,7 @@ GitHub Pages 静态前端
 - 每次完成课程、测验、诊断、提交证据、复习和记录实验后自动同步。
 - 支持邮箱 magic link 和 GitHub OAuth。
 
-页面顶部始终显示“账号 / 登录”入口。未配置 Supabase 时，入口会明确显示“登录待配置”和本机保存状态；配置 Supabase 后，同一入口会切换成邮箱登录、GitHub 登录、立即同步和退出操作。
+页面顶部始终显示“账号 / 登录”入口。未配置 Supabase 时，入口会显示平台内配置向导：Supabase SQL/RLS、Redirect URL、当前浏览器临时配置表单，以及 GitHub Variables 命令。配置 Supabase 后，同一入口会切换成邮箱登录、GitHub 登录、立即同步和退出操作。
 
 ### Supabase 数据库
 
@@ -229,14 +229,14 @@ POST /api/reset-state
 
 ## 官方讲义与课程材料
 
-每个 lesson 都带有结构化的官方材料元数据：
+每个 lesson 都带有结构化的官方材料元数据，并在平台内用专门阅读器呈现：
 
-- PDF 幻灯片会嵌入官方 GitHub raw 文件，并保留官方 GitHub 页面链接。
-- lecture trace 会嵌入 Stanford CS336 官方 trace 页面。
+- PDF 幻灯片使用平台内 PDF 阅读器：基础层用 `<object type="application/pdf">` 内嵌预览，增强层用 PDF.js 渲染 canvas，不再依赖浏览器直接下载。
+- Python lecture trace 会读取官方 `.py` 源文件，解析其中的 `text(...)`、`image(...)`、`@inspect` 和源码结构，呈现为“讲义 / 图片 / 源码”三视图。
 - 预备课或无单独材料的客座课会回退到官方 schedule。
 - “讲义”标签页会给出原始材料阅读顺序、本平台讲解对应点、公式回读、代码回读和掌握证据要求。
 
-本项目不复制官方 PDF 或讲义正文，只做官方链接嵌入、跳转和中文学习拆解。
+静态导出时会尽量把公开官方材料镜像到 `dist/data/lectures/`，前端优先读取同源资源，失败时再回退官方 raw URL。本项目不把官方材料内容写进源码仓库，只在部署产物中做平台内阅读缓存和中文学习拆解。
 
 ## 正确性与掌握标准
 

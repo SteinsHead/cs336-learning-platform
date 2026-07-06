@@ -40,6 +40,8 @@ const state = {
 };
 
 const els = {
+  layout: document.querySelector(".layout"),
+  workspace: document.querySelector(".workspace"),
   phaseList: document.querySelector("#phaseList"),
   lessonMeta: document.querySelector("#lessonMeta"),
   lessonTitle: document.querySelector("#lessonTitle"),
@@ -1114,6 +1116,9 @@ function renderPhases(filter = "") {
 function renderLesson() {
   state.copyPayloads.clear();
   renderLessonHeader();
+  const shouldUseSourceFocus = state.tab === "source";
+  const wasSourceFocus = els.layout?.classList.contains("source-focus");
+  els.layout?.classList.toggle("source-focus", shouldUseSourceFocus);
   const lesson = getCurrentLesson();
   if (state.tab === "overview") renderOverview(lesson);
   if (state.tab === "source") renderSource(lesson);
@@ -1123,6 +1128,9 @@ function renderLesson() {
   if (state.tab === "map") renderMap(lesson);
   if (state.tab === "mastery") renderMastery(lesson);
   if (state.tab === "system") renderSystem();
+  if (shouldUseSourceFocus && !wasSourceFocus && window.matchMedia("(max-width: 860px)").matches) {
+    queueMicrotask(() => els.workspace?.scrollIntoView({ block: "start" }));
+  }
 }
 
 function renderLessonHeader() {

@@ -231,6 +231,14 @@ h3 {
   padding: 22px 28px 32px;
 }
 
+.layout.source-focus {
+  grid-template-columns: 300px minmax(0, 1fr);
+}
+
+.layout.source-focus .utility {
+  display: none;
+}
+
 .sidebar,
 .utility {
   align-self: start;
@@ -509,6 +517,10 @@ h3 {
   padding: 12px;
 }
 
+.trace-reader {
+  container-type: inline-size;
+}
+
 .reader-toolbar {
   display: flex;
   min-height: 42px;
@@ -626,16 +638,15 @@ h3 {
 
 .trace-document {
   display: grid;
-  grid-template-columns: minmax(170px, 230px) minmax(0, 1fr);
-  gap: 18px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
   align-items: start;
 }
 
 .trace-outline {
-  position: sticky;
-  top: 12px;
+  position: static;
   display: grid;
-  max-height: 70vh;
+  max-height: 260px;
   overflow: auto;
   gap: 10px;
   border: 1px solid var(--line);
@@ -677,15 +688,15 @@ h3 {
 .trace-article {
   display: grid;
   min-width: 0;
-  gap: 18px;
+  gap: 22px;
 }
 
 .trace-section {
   display: grid;
   min-width: 0;
-  gap: 12px;
+  gap: 14px;
   border-bottom: 1px solid var(--line);
-  padding-bottom: 18px;
+  padding-bottom: 22px;
 }
 
 .trace-section:last-child {
@@ -696,6 +707,7 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 10px;
   color: var(--muted);
   font-size: 12px;
@@ -706,10 +718,15 @@ h3 {
   color: var(--green);
 }
 
+.trace-section-meta span {
+  min-width: 0;
+}
+
 .trace-heading {
   margin: 8px 0 0;
   color: var(--ink);
   line-height: 1.25;
+  overflow-wrap: anywhere;
 }
 
 .trace-paragraph,
@@ -718,8 +735,17 @@ h3 {
   max-width: 88ch;
   margin: 0;
   color: var(--ink);
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+
+.trace-paragraph code,
+.trace-quote code,
+.trace-list code {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .trace-list {
@@ -783,9 +809,15 @@ h3 {
   margin: 2px 0 8px;
 }
 
+.trace-figure {
+  min-height: 96px;
+  align-content: start;
+}
+
 .trace-figure img,
 .trace-gallery-card img {
   width: min(100%, var(--trace-image-width));
+  min-height: 88px;
   max-height: 620px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -798,6 +830,7 @@ h3 {
   color: var(--muted);
   font-size: 12px;
   font-weight: 750;
+  overflow-wrap: anywhere;
 }
 
 .trace-code-step,
@@ -812,7 +845,7 @@ h3 {
 .trace-code-step {
   display: grid;
   gap: 8px;
-  padding: 10px;
+  padding: 12px;
 }
 
 .trace-code-head {
@@ -832,7 +865,7 @@ h3 {
 .trace-verbatim {
   overflow: auto;
   margin: 0;
-  padding: 12px;
+  padding: 14px;
   font-size: 13px;
   line-height: 1.65;
 }
@@ -872,6 +905,19 @@ h3 {
   border-radius: 8px;
   background: var(--surface);
   padding: 12px;
+}
+
+@container (min-width: 760px) {
+  .trace-document {
+    grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+    gap: 24px;
+  }
+
+  .trace-outline {
+    position: sticky;
+    top: 12px;
+    max-height: 70vh;
+  }
 }
 
 .source-guidance-grid {
@@ -2163,6 +2209,28 @@ body.modal-open {
   .layout {
     grid-template-columns: 1fr;
     padding: 16px;
+  }
+
+  .layout.source-focus {
+    grid-template-columns: 1fr;
+    padding: 12px;
+  }
+
+  .layout.source-focus .sidebar {
+    display: none;
+  }
+
+  .layout.source-focus .lesson-body {
+    padding: 14px;
+  }
+
+  .layout.source-focus .official-material-card,
+  .layout.source-focus .source-guide-card {
+    padding: 12px;
+  }
+
+  .layout.source-focus .trace-reader {
+    padding: 8px;
   }
 
   .sidebar,

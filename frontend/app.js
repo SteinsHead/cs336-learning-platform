@@ -34,6 +34,7 @@ const state = {
     page: 1,
     scale: 1,
     traceEntries: [],
+    traceSections: [],
   },
   quizSelections: {},
 };
@@ -1310,8 +1311,8 @@ function sourceReaderMarkup(lesson, material) {
       <div class="trace-reader" data-trace-url="${escapeHtml(material.local_reader_url || material.source_text_url || material.reader_url || "")}">
         <div class="reader-toolbar">
           <div class="segmented-control" aria-label="讲义视图">
-            <button class="active" type="button" data-trace-mode="lecture">讲义</button>
-            <button type="button" data-trace-mode="images">图片</button>
+            <button class="active" type="button" data-trace-mode="lecture">阅读</button>
+            <button type="button" data-trace-mode="images">图片墙</button>
             <button type="button" data-trace-mode="source">源码</button>
           </div>
           <span id="traceReaderStatus" class="reader-status compact">正在加载官方 Python 讲义...</span>
@@ -1393,6 +1394,7 @@ async function initTraceReader(lesson, material) {
     const source = await fetchTextWithFallback(urls);
     const parsed = parseLectureTraceSource(source, material);
     state.sourceReader.traceEntries = parsed.entries;
+    state.sourceReader.traceSections = parsed.sections;
     state.sourceReader.traceSource = source;
     state.sourceReader.traceMeta = parsed.meta;
     renderTraceMode("lecture", lesson);
@@ -1426,70 +1428,288 @@ async function fetchTextWithFallback(urls) {
 }
 
 function parseLectureTraceSource(source, material) {
-  const entries = [];
-  const codeLines = [];
-  const mainOrder = parseMainCallOrder(source);
-  const definitionOrder = new Map();
-  let currentSection = "Lecture";
-  source.split("\n").forEach((line, index) => {
-    const lineNo = index + 1;
-    const defMatch = line.match(/^def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
-    const classMatch = line.match(/^class\s+([A-Za-z_][A-Za-z0-9_]*)/);
-    if (defMatch || classMatch) {
-      currentSection = defMatch?.[1] || classMatch?.[1] || currentSection;
-      if (!definitionOrder.has(currentSection)) definitionOrder.set(currentSection, definitionOrder.size);
-      codeLines.push({ line: lineNo, code: line });
-    }
-    if (line.includes("@inspect") || line.includes("@stepover")) codeLines.push({ line: lineNo, code: line.trim() });
-
-    const textValue = extractStringCall(line, "text");
-    if (textValue) entries.push({ type: "text", text: textValue, section: currentSection, line: lineNo });
-
-    const imageValue = extractImageCall(line, material);
-    if (imageValue) entries.push({ type: "image", section: currentSection, line: lineNo, ...imageValue });
-
-    const linkValue = extractLinkCall(line);
-    if (linkValue) entries.push({ type: "link", section: currentSection, line: lineNo, ...linkValue });
+  const lines = source.split("\n");
+  const definitions = parseTopLevelDefinitions(lines);
+  const functionDefs = new Map(definitions.filter((item) => item.kind === "def").map((item) => [item.name, item]));
+  const functionNames = new Set(functionDefs.keys());
+  const functionEvents = new Map();
+  functionDefs.forEach((definition, name) => {
+    functionEvents.set(name, parseDefinitionTraceEvents(definition, lines, material, functionNames));
   });
-  entries.sort((left, right) => traceEntryRank(left, mainOrder, definitionOrder) - traceEntryRank(right, mainOrder, definitionOrder) || left.line - right.line);
+  const expandable = computeExpandableTraceFunctions(functionEvents);
+  const sections = buildTraceSections(functionEvents, functionDefs, expandable);
+  const entries = sections.flatMap((section) => section.entries.map((entry) => ({ ...entry, section: section.name, sectionId: section.id })));
+  const codeLines = entries.filter((entry) => entry.type === "code").map((entry) => ({ line: entry.line, code: entry.rawCode || entry.code }));
   return {
+    sections,
     entries,
     meta: {
       textCount: entries.filter((entry) => entry.type === "text").length,
       imageCount: entries.filter((entry) => entry.type === "image").length,
       linkCount: entries.filter((entry) => entry.type === "link").length,
+      sectionCount: sections.length,
       codeLines,
     },
   };
 }
 
-function parseMainCallOrder(source) {
-  const calls = [];
-  let inMain = false;
-  source.split("\n").forEach((line) => {
-    if (line.startsWith("def main(")) {
-      inMain = true;
-      return;
-    }
-    if (inMain && /^def\s+/.test(line)) inMain = false;
-    if (!inMain) return;
-    const call = line.match(/^\s{4}([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
-    if (call && !["text", "image", "link"].includes(call[1])) calls.push(call[1]);
+function parseTopLevelDefinitions(lines) {
+  const definitions = [];
+  lines.forEach((line, index) => {
+    const match = line.match(/^(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\(:]/);
+    if (!match) return;
+    definitions.push({
+      kind: match[1],
+      name: match[2],
+      startIndex: index,
+      startLine: index + 1,
+      endIndex: lines.length,
+      endLine: lines.length,
+    });
   });
-  return new Map(calls.map((name, index) => [name, index]));
+  definitions.forEach((definition, index) => {
+    const next = definitions[index + 1];
+    if (next) {
+      definition.endIndex = next.startIndex;
+      definition.endLine = next.startLine - 1;
+    }
+  });
+  return definitions;
 }
 
-function traceEntryRank(entry, mainOrder, definitionOrder) {
-  if (mainOrder.has(entry.section)) return mainOrder.get(entry.section);
-  if (entry.section === "main") return 10000;
-  return 100 + (definitionOrder.get(entry.section) ?? 9000);
+function parseDefinitionTraceEvents(definition, lines, material, functionNames) {
+  const events = [];
+  for (let index = definition.startIndex + 1; index < definition.endIndex; index += 1) {
+    const line = lines[index];
+    const lineNo = index + 1;
+    const traceCalls = parseTraceCallsFromLine(line, lineNo, material);
+    if (traceCalls.length) events.push(...attachInlineTraceReferences(traceCalls));
+
+    const codeEvent = parseTraceCodeEvent(line, lineNo);
+    if (codeEvent) events.push(codeEvent);
+
+    const callMatch = line.match(/^\s{4,}([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    const target = callMatch?.[1] || "";
+    if (target && target !== definition.name && functionNames.has(target) && !traceCalls.length) {
+      events.push({ type: "section-call", target, line: lineNo });
+    }
+  }
+  return events.sort((left, right) => left.line - right.line || traceEventOrder(left) - traceEventOrder(right));
 }
 
-function extractStringCall(line, name) {
-  const marker = `${name}(`;
-  const start = line.indexOf(marker);
-  if (start < 0) return "";
-  return extractFirstString(line.slice(start + marker.length));
+function traceEventOrder(entry) {
+  return { text: 1, link: 2, image: 3, code: 4, "section-call": 5 }[entry.type] || 9;
+}
+
+function computeExpandableTraceFunctions(functionEvents) {
+  const expandable = new Set();
+  functionEvents.forEach((events, name) => {
+    if (events.some((event) => event.type !== "section-call")) expandable.add(name);
+  });
+  let changed = true;
+  while (changed) {
+    changed = false;
+    functionEvents.forEach((events, name) => {
+      if (expandable.has(name)) return;
+      if (events.some((event) => event.type === "section-call" && expandable.has(event.target))) {
+        expandable.add(name);
+        changed = true;
+      }
+    });
+  }
+  return expandable;
+}
+
+function buildTraceSections(functionEvents, functionDefs, expandable) {
+  const sections = [];
+  let sequence = 0;
+  const stack = new Set();
+  const startName = functionEvents.has("main") ? "main" : [...functionEvents.keys()].find((name) => expandable.has(name));
+
+  function walk(name, depth = 0) {
+    if (!name || !functionEvents.has(name) || stack.has(name)) return;
+    stack.add(name);
+    let chunk = null;
+    const definition = functionDefs.get(name);
+    const ensureChunk = () => {
+      if (!chunk) {
+        sequence += 1;
+        chunk = {
+          id: `trace-section-${sequence}-${slugifyTraceId(name)}`,
+          name,
+          title: humanizePythonName(name),
+          depth,
+          startLine: definition?.startLine || 1,
+          endLine: definition?.endLine || definition?.startLine || 1,
+          entries: [],
+        };
+        sections.push(chunk);
+      }
+      return chunk;
+    };
+
+    for (const event of functionEvents.get(name) || []) {
+      if (event.type === "section-call") {
+        if (expandable.has(event.target)) {
+          chunk = null;
+          walk(event.target, depth + 1);
+        }
+        continue;
+      }
+      ensureChunk().entries.push({ ...event, depth });
+    }
+    stack.delete(name);
+  }
+
+  walk(startName, 0);
+  if (!sections.length) {
+    functionEvents.forEach((events, name) => {
+      const realEvents = events.filter((event) => event.type !== "section-call");
+      if (!realEvents.length) return;
+      sequence += 1;
+      const definition = functionDefs.get(name);
+      sections.push({
+        id: `trace-section-${sequence}-${slugifyTraceId(name)}`,
+        name,
+        title: humanizePythonName(name),
+        depth: 0,
+        startLine: definition?.startLine || 1,
+        endLine: definition?.endLine || definition?.startLine || 1,
+        entries: realEvents,
+      });
+    });
+  }
+  return sections;
+}
+
+function parseTraceCallsFromLine(line, lineNo, material) {
+  const events = [];
+  const pattern = /\b(article_link|post_link|video_link|text|image|link)\s*\(/g;
+  let match = pattern.exec(line);
+  while (match) {
+    const openIndex = line.indexOf("(", match.index);
+    const segment = extractBalancedCall(line, openIndex);
+    if (!segment) {
+      match = pattern.exec(line);
+      continue;
+    }
+    const event = parseTraceCall(match[1], segment.body, lineNo, material);
+    if (event) events.push(event);
+    pattern.lastIndex = segment.end + 1;
+    match = pattern.exec(line);
+  }
+  return events;
+}
+
+function extractBalancedCall(line, openIndex) {
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let index = openIndex; index < line.length; index += 1) {
+    const char = line[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "(") depth += 1;
+    if (char === ")") {
+      depth -= 1;
+      if (depth === 0) return { body: line.slice(openIndex + 1, index), end: index };
+    }
+  }
+  return null;
+}
+
+function parseTraceCall(name, args, lineNo, material) {
+  if (name === "text") return parseTraceTextCall(args, lineNo);
+  if (name === "image") return parseTraceImageCall(args, lineNo, material);
+  return parseTraceLinkCall(name, args, lineNo);
+}
+
+function parseTraceTextCall(args, lineNo) {
+  const firstArg = extractFirstArgument(args);
+  const text = extractFirstString(firstArg);
+  const expression = text ? "" : cleanTraceExpression(firstArg);
+  return {
+    type: "text",
+    text,
+    expression,
+    unresolved: !text && Boolean(expression),
+    verbatim: /\bverbatim\s*=\s*True\b/.test(args),
+    references: [],
+    line: lineNo,
+  };
+}
+
+function parseTraceImageCall(args, lineNo, material) {
+  const src = extractFirstString(extractFirstArgument(args));
+  if (!src) return null;
+  const widthMatch = args.match(/\bwidth\s*=\s*(\d+)/);
+  return {
+    type: "image",
+    src: resolveMaterialUrl(src, material),
+    originalSrc: src,
+    width: widthMatch ? Number(widthMatch[1]) : 640,
+    line: lineNo,
+  };
+}
+
+function parseTraceLinkCall(name, args, lineNo) {
+  const firstArg = extractFirstArgument(args);
+  const namedUrl = extractNamedStringArgument(args, "url");
+  const firstString = extractFirstString(firstArg);
+  const url = namedUrl || (/^https?:\/\//.test(firstString) ? firstString : "");
+  const symbol = url ? "" : cleanTraceExpression(firstArg);
+  const title = extractNamedStringArgument(args, "title") || (url ? compactUrlLabel(url) : symbol || traceLinkKindLabel(name));
+  return {
+    type: "link",
+    url,
+    title,
+    symbol,
+    kind: name,
+    line: lineNo,
+  };
+}
+
+function attachInlineTraceReferences(events) {
+  const output = [];
+  for (const event of events) {
+    const previous = output[output.length - 1];
+    if (event.type === "link" && previous?.type === "text" && previous.line === event.line) {
+      previous.references = [...(previous.references || []), event];
+    } else {
+      output.push(event);
+    }
+  }
+  return output;
+}
+
+function parseTraceCodeEvent(line, lineNo) {
+  if (!line.includes("@inspect") && !line.includes("@stepover")) return null;
+  const commentIndex = line.indexOf("#");
+  const code = (commentIndex >= 0 ? line.slice(0, commentIndex) : line).trim();
+  const comment = commentIndex >= 0 ? line.slice(commentIndex + 1).trim() : "";
+  const note = comment.replace(/@inspect\s+[A-Za-z_][A-Za-z0-9_.]*/g, "").replace(/@stepover/g, "").trim();
+  const inspectVars = [...line.matchAll(/@inspect\s+([A-Za-z_][A-Za-z0-9_.]*)/g)].map((match) => match[1]);
+  return {
+    type: "code",
+    code,
+    rawCode: line.trim(),
+    inspectVars,
+    stepOver: line.includes("@stepover"),
+    note,
+    line: lineNo,
+  };
 }
 
 function extractFirstString(text) {
@@ -1514,26 +1734,50 @@ function extractFirstString(text) {
   return output;
 }
 
-function extractImageCall(line, material) {
-  const src = extractStringCall(line, "image");
-  if (!src) return null;
-  const widthMatch = line.match(/width\s*=\s*(\d+)/);
-  return {
-    src: resolveMaterialUrl(src, material),
-    originalSrc: src,
-    width: widthMatch ? Number(widthMatch[1]) : 640,
-  };
+function extractFirstArgument(args) {
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const char = args[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if ("([{".includes(char)) depth += 1;
+    if (")]}".includes(char)) depth -= 1;
+    if (char === "," && depth === 0) return args.slice(0, index).trim();
+  }
+  return args.trim();
 }
 
-function extractLinkCall(line) {
-  if (!/\b(link|article_link|post_link|video_link)\s*\(/.test(line)) return null;
-  const urlMatch = line.match(/url\s*=\s*["']([^"']+)["']/) || line.match(/\b(?:link|article_link|post_link|video_link)\s*\(\s*["']([^"']+)["']/);
-  const titleMatch = line.match(/title\s*=\s*["']([^"']+)["']/);
-  if (!urlMatch) return null;
+function extractNamedStringArgument(args, name) {
+  const match = args.match(new RegExp(`\\b${name}\\s*=`));
+  if (!match) return "";
+  return extractFirstString(args.slice(match.index + match[0].length));
+}
+
+function cleanTraceExpression(value) {
+  return String(value || "").trim().replace(/,$/, "");
+}
+
+function traceLinkKindLabel(kind) {
   return {
-    url: urlMatch[1],
-    title: titleMatch?.[1] || compactUrlLabel(urlMatch[1]),
-  };
+    article_link: "article",
+    post_link: "post",
+    video_link: "video",
+    link: "reference",
+  }[kind] || "reference";
 }
 
 function resolveMaterialUrl(src, material) {
@@ -1556,8 +1800,9 @@ function renderTraceMode(mode, lesson) {
   if (!body) return;
   document.querySelectorAll("[data-trace-mode]").forEach((button) => button.classList.toggle("active", button.dataset.traceMode === mode));
   const entries = state.sourceReader.traceEntries || [];
-  const meta = state.sourceReader.traceMeta || { textCount: 0, imageCount: 0, linkCount: 0, codeLines: [] };
-  if (status) status.textContent = `${meta.textCount} 段讲义 · ${meta.imageCount} 张图 · ${meta.codeLines.length} 个代码锚点`;
+  const sections = state.sourceReader.traceSections || [];
+  const meta = state.sourceReader.traceMeta || { textCount: 0, imageCount: 0, sectionCount: 0, linkCount: 0, codeLines: [] };
+  if (status) status.textContent = `${meta.sectionCount || sections.length} 个阅读段 · ${meta.textCount} 段正文 · ${meta.imageCount} 张图 · ${meta.codeLines.length} 个代码检查点`;
 
   if (mode === "source") {
     body.innerHTML = `
@@ -1570,38 +1815,209 @@ function renderTraceMode(mode, lesson) {
     return;
   }
 
-  const filtered = mode === "images" ? entries.filter((entry) => entry.type === "image") : entries.filter((entry) => entry.type !== "link");
+  if (mode === "images") {
+    const images = entries.filter((entry) => entry.type === "image");
+    body.innerHTML = `
+      <div class="trace-summary">
+        <strong>${escapeHtml(lesson.lecture)} 图片墙</strong>
+        <span>这些图片仍会在“阅读”视图中出现在原始上下文位置；这里用于快速总览图表和截图。</span>
+      </div>
+      <div class="trace-gallery-grid">
+        ${images.length ? images.map((entry) => traceImageMarkup(entry, true)).join("") : `<p class="small-text">这个视图没有可展示图片。</p>`}
+      </div>
+    `;
+    return;
+  }
+
   body.innerHTML = `
     <div class="trace-summary">
-      <strong>${escapeHtml(lesson.lecture)} 平台内讲义阅读器</strong>
-      <span>从官方 Python trace 提取 text/image/code 标注，保留原始材料结构，并加入可读版排版。</span>
+      <strong>${escapeHtml(lesson.lecture)} executable lecture 阅读器</strong>
+      <span>按 main() 调用顺序重建章节流；正文、图片、引用和 @inspect 代码检查点保留在同一个上下文中。</span>
     </div>
-    <div class="trace-entry-list">
-      ${filtered.length ? filtered.map((entry) => traceEntryMarkup(entry)).join("") : `<p class="small-text">这个视图没有可展示内容。</p>`}
+    <div class="trace-document">
+      ${traceOutlineMarkup(sections)}
+      <article class="trace-article">
+        ${sections.length ? sections.map((section) => traceSectionMarkup(section)).join("") : `<p class="small-text">这个视图没有可展示内容。</p>`}
+      </article>
     </div>
   `;
 }
 
-function traceEntryMarkup(entry) {
-  if (entry.type === "image") {
+function traceOutlineMarkup(sections) {
+  const visibleSections = sections.filter((section) => section.entries.length);
+  if (visibleSections.length < 2) return "";
+  return `
+    <aside class="trace-outline" aria-label="讲义结构">
+      <strong>讲义结构</strong>
+      <nav>
+        ${visibleSections
+          .map(
+            (section) => `
+              <a href="#${escapeHtml(section.id)}" style="--trace-depth: ${Math.min(4, section.depth || 0)}">
+                <span>${escapeHtml(section.title)}</span>
+                <small>${escapeHtml(traceSectionSubtitle(section))}</small>
+              </a>
+            `,
+          )
+          .join("")}
+      </nav>
+    </aside>
+  `;
+}
+
+function traceSectionMarkup(section) {
+  return `
+    <section class="trace-section" id="${escapeHtml(section.id)}">
+      <div class="trace-section-meta">
+        <span>${escapeHtml(section.title)}</span>
+        <span>source lines ${section.startLine}-${section.endLine}</span>
+      </div>
+      ${traceEntriesMarkup(section.entries)}
+    </section>
+  `;
+}
+
+function traceEntriesMarkup(entries) {
+  const parts = [];
+  let pendingList = null;
+  let pendingPre = [];
+
+  const flushList = () => {
+    if (!pendingList) return;
+    const tag = pendingList.ordered ? "ol" : "ul";
+    parts.push(`<${tag} class="trace-list">${pendingList.items.join("")}</${tag}>`);
+    pendingList = null;
+  };
+  const flushPre = () => {
+    if (!pendingPre.length) return;
+    parts.push(traceVerbatimMarkup(pendingPre));
+    pendingPre = [];
+  };
+
+  for (const entry of entries) {
+    if (entry.type === "text" && entry.verbatim) {
+      flushList();
+      pendingPre.push(entry);
+      continue;
+    }
+    if (entry.type === "text" && traceListInfo(entry.text)) {
+      flushPre();
+      const info = traceListInfo(entry.text);
+      if (!pendingList || pendingList.ordered !== info.ordered) flushList();
+      if (!pendingList) pendingList = { ordered: info.ordered, items: [] };
+      pendingList.items.push(`<li>${markdownLite(info.text)}${traceInlineReferences(entry.references)}</li>`);
+      continue;
+    }
+    flushList();
+    flushPre();
+    if (entry.type === "text") parts.push(traceTextMarkup(entry));
+    if (entry.type === "image") parts.push(traceImageMarkup(entry));
+    if (entry.type === "link") parts.push(traceReferenceMarkup(entry));
+    if (entry.type === "code") parts.push(traceCodeMarkup(entry));
+  }
+  flushList();
+  flushPre();
+  return parts.join("");
+}
+
+function traceTextMarkup(entry) {
+  const text = entry.text || "";
+  if (entry.unresolved) {
     return `
-      <figure class="trace-image-card">
-        <img src="${escapeHtml(entry.src)}" alt="${escapeHtml(entry.originalSrc)}" loading="lazy" style="max-width: ${Math.min(100, Math.round((entry.width || 640) / 8))}%;" />
-        <figcaption>${escapeHtml(entry.section)} · line ${entry.line} · ${escapeHtml(entry.originalSrc)}</figcaption>
-      </figure>
+      <div class="trace-runtime-text">
+        <code>text(${escapeHtml(entry.expression)})</code>
+        <span>这段内容由官方讲义运行时生成；当前平台保留源码锚点，完整值需执行官方 lecture trace。</span>
+      </div>
     `;
   }
-  const text = entry.text || "";
   const heading = text.match(/^(#{1,4})\s+(.+)/);
   if (heading) {
-    const level = Math.min(4, heading[1].length + 2);
-    return `<article class="trace-heading-card"><h${level}>${markdownLite(heading[2])}</h${level}><span>${escapeHtml(entry.section)} · line ${entry.line}</span></article>`;
+    const level = Math.min(5, heading[1].length + 2);
+    return `<h${level} class="trace-heading">${markdownLite(heading[2])}${traceInlineReferences(entry.references)}</h${level}>`;
   }
-  const bullet = text.match(/^[-*]\s+(.+)/);
-  if (bullet) {
-    return `<article class="trace-text-card bullet"><span aria-hidden="true">•</span><p>${markdownLite(bullet[1])}</p></article>`;
+  if (text.startsWith(">")) {
+    return `<blockquote class="trace-quote">${markdownLite(text.replace(/^>\s*/, ""))}${traceInlineReferences(entry.references)}</blockquote>`;
   }
-  return `<article class="trace-text-card"><p>${markdownLite(text)}</p><span>${escapeHtml(entry.section)} · line ${entry.line}</span></article>`;
+  return `<p class="trace-paragraph">${markdownLite(text)}${traceInlineReferences(entry.references)}</p>`;
+}
+
+function traceImageMarkup(entry, gallery = false) {
+  const width = Math.max(240, Math.min(980, entry.width || 640));
+  return `
+    <figure class="${gallery ? "trace-gallery-card" : "trace-figure"}" style="--trace-image-width: ${width}px">
+      <img src="${escapeHtml(entry.src)}" alt="${escapeHtml(entry.originalSrc)}" loading="lazy" />
+      <figcaption>${escapeHtml(entry.originalSrc)} · line ${entry.line}</figcaption>
+    </figure>
+  `;
+}
+
+function traceReferenceMarkup(entry) {
+  return `
+    <div class="trace-reference-row">
+      <span>${escapeHtml(traceLinkKindLabel(entry.kind))}</span>
+      ${traceReferenceAnchor(entry)}
+    </div>
+  `;
+}
+
+function traceInlineReferences(references = []) {
+  if (!references.length) return "";
+  return `
+    <span class="trace-inline-refs">
+      ${references.map((reference) => traceReferenceAnchor(reference)).join("")}
+    </span>
+  `;
+}
+
+function traceReferenceAnchor(entry) {
+  if (entry.url) {
+    return `<a href="${escapeHtml(entry.url)}" target="_blank" rel="noreferrer">${escapeHtml(entry.title)}</a>`;
+  }
+  return `<code>${escapeHtml(entry.title || entry.symbol || "reference")}</code>`;
+}
+
+function traceCodeMarkup(entry) {
+  const label = entry.inspectVars.length ? `inspect ${entry.inspectVars.join(", ")}` : entry.stepOver ? "step over" : "code";
+  return `
+    <div class="trace-code-step">
+      <div class="trace-code-head">
+        <strong>${escapeHtml(label)}</strong>
+        <span>line ${entry.line}</span>
+      </div>
+      <pre><code>${highlightCodeLine(entry.code || entry.rawCode, "python")}</code></pre>
+      ${entry.note ? `<p>${escapeHtml(entry.note)}</p>` : ""}
+    </div>
+  `;
+}
+
+function traceVerbatimMarkup(entries) {
+  const text = entries.map((entry) => entry.text || entry.expression || "").join("\n");
+  return `<pre class="trace-verbatim"><code>${escapeHtml(text)}</code></pre>`;
+}
+
+function traceListInfo(text) {
+  const unordered = text?.match(/^[-*]\s+(.+)/);
+  if (unordered) return { ordered: false, text: unordered[1] };
+  const ordered = text?.match(/^\d+\.\s+(.+)/);
+  if (ordered) return { ordered: true, text: ordered[1] };
+  return null;
+}
+
+function traceSectionSubtitle(section) {
+  const heading = section.entries.find((entry) => entry.type === "text" && /^(#{1,4})\s+/.test(entry.text || ""));
+  if (heading) return heading.text.replace(/^(#{1,4})\s+/, "");
+  const firstText = section.entries.find((entry) => entry.type === "text" && entry.text);
+  if (firstText && firstText.text.length <= 70) return firstText.text.replace(/^[-*]\s+/, "");
+  return `line ${section.startLine}`;
+}
+
+function humanizePythonName(name) {
+  if (name === "main") return "Lecture flow";
+  return name.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function slugifyTraceId(value) {
+  return String(value || "section").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "section";
 }
 
 function markdownLite(value) {

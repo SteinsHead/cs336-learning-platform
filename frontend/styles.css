@@ -269,6 +269,15 @@ h3 {
   font-weight: 800;
 }
 
+.sidebar-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.mobile-curriculum-toggle {
+  display: none;
+}
+
 .phase-list {
   display: grid;
   gap: 10px;
@@ -967,6 +976,150 @@ h3 {
 
 .concept-list {
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.studio-shell {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.studio-head,
+.studio-brief,
+.studio-actions,
+.studio-result-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.studio-head {
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+}
+
+.studio-head h3,
+.studio-brief h4,
+.studio-brief p {
+  margin-bottom: 0;
+}
+
+.studio-select-label {
+  display: grid;
+  min-width: min(320px, 42%);
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+#studioTask {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+}
+
+.studio-brief {
+  align-items: flex-start;
+}
+
+.studio-learning-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.studio-learning-grid > div {
+  border-left: 3px solid var(--blue);
+  background: var(--blue-soft);
+  padding: 12px 14px;
+}
+
+.studio-learning-grid ol,
+.studio-learning-grid ul {
+  display: grid;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.studio-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.studio-actions .small-text {
+  margin-left: auto;
+}
+
+.studio-output {
+  min-height: 72px;
+  overflow: hidden;
+  border: 1px solid #303a46;
+  border-radius: 6px;
+  background: #151b22;
+  color: #dbe5ee;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  padding: 12px;
+}
+
+.studio-result-head {
+  margin: -12px -12px 8px;
+  padding: 10px 12px;
+  background: #202933;
+}
+
+.studio-result-head.passed {
+  color: #86d3b1;
+}
+
+.studio-result-head.failed,
+.studio-error strong {
+  color: #f0a39b;
+}
+
+.studio-test-row {
+  display: grid;
+  grid-template-columns: 44px minmax(120px, 0.5fr) minmax(0, 1fr);
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid #303a46;
+}
+
+.studio-test-row > span {
+  color: #86d3b1;
+  font-weight: 800;
+}
+
+.studio-test-row.failed > span {
+  color: #f0a39b;
+}
+
+.studio-test-row code {
+  overflow-wrap: anywhere;
+  color: #aebdca;
+}
+
+.studio-output pre {
+  overflow-x: auto;
+  margin: 8px 0 0;
+  white-space: pre-wrap;
+}
+
+.studio-tests summary {
+  cursor: pointer;
+  color: var(--blue);
+  font-weight: 800;
+}
+
+.studio-tests[open] summary {
+  margin-bottom: 12px;
 }
 
 .math-block {
@@ -2158,6 +2311,12 @@ body.modal-open {
   background: var(--green-soft);
 }
 
+.quiz-options button.selected {
+  border-color: var(--blue);
+  background: var(--blue-soft);
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
 .quiz-options button.wrong {
   border-color: var(--red);
   background: var(--red-soft);
@@ -2174,7 +2333,7 @@ body.modal-open {
   font-size: 13px;
 }
 
-@media (max-width: 1180px) {
+@media (max-width: 1500px) {
   .layout {
     grid-template-columns: 280px minmax(0, 1fr);
   }
@@ -2239,6 +2398,18 @@ body.modal-open {
     max-height: none;
   }
 
+  .mobile-curriculum-toggle {
+    display: inline-flex;
+  }
+
+  .sidebar .phase-list {
+    display: none;
+  }
+
+  .sidebar.mobile-expanded .phase-list {
+    display: grid;
+  }
+
   .utility {
     grid-template-columns: 1fr;
   }
@@ -2261,8 +2432,33 @@ body.modal-open {
   .line-explain,
   .weak-row,
   .trace-document,
-  .source-guidance-grid {
+  .source-guidance-grid,
+  .studio-learning-grid {
     grid-template-columns: 1fr;
+  }
+
+  .studio-head,
+  .studio-brief {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .studio-select-label {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .studio-actions .small-text {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .studio-test-row {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+
+  .studio-test-row code {
+    grid-column: 1 / -1;
   }
 
   .trace-outline {

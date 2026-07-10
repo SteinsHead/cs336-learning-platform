@@ -1,15 +1,20 @@
+import { highlightPythonLine } from "./code-highlight.js";
+
 const STATIC_CURRICULUM_URL = "data/curriculum.json";
 const LOCAL_STATE_KEY = "cs336.learning_state.v2";
 const LOCAL_CONFIG_KEY = "cs336.cloud_config.v1";
+const LOCAL_UI_KEY = "cs336.ui_state.v1";
+const LOCAL_STUDIO_CODE_KEY = "cs336.studio_code.v1";
+const initialUiState = loadUiState();
 let CONFIG = loadAppConfig();
 
 const state = {
   data: null,
-  currentLessonId: "prep-python",
-  tab: "overview",
+  currentLessonId: initialUiState.lessonId || "prep-python",
+  tab: initialUiState.tab || "overview",
   completed: new Set(JSON.parse(localStorage.getItem("cs336.completed") || "[]")),
-  activeQuiz: "q-basics",
-  activeLab: "bpe",
+  activeQuiz: "",
+  activeLab: "",
   copyPayloads: new Map(),
   dashboard: null,
   serverState: null,
@@ -37,10 +42,20 @@ const state = {
     traceSections: [],
   },
   quizSelections: {},
+  quizSubmitted: false,
+  practice: {
+    worker: null,
+    ready: false,
+    taskId: "",
+    running: false,
+    pending: new Map(),
+    readyPromise: null,
+  },
 };
 
 const els = {
   layout: document.querySelector(".layout"),
+  sidebar: document.querySelector(".sidebar"),
   workspace: document.querySelector(".workspace"),
   phaseList: document.querySelector("#phaseList"),
   lessonMeta: document.querySelector("#lessonMeta"),
@@ -50,6 +65,7 @@ const els = {
   progressBar: document.querySelector("#progressBar"),
   markDone: document.querySelector("#markDone"),
   resetProgress: document.querySelector("#resetProgress"),
+  mobileCurriculumToggle: document.querySelector("#mobileCurriculumToggle"),
   searchInput: document.querySelector("#searchInput"),
   labSelect: document.querySelector("#labSelect"),
   labPanel: document.querySelector("#labPanel"),
@@ -63,6 +79,9 @@ const els = {
   evidenceText: document.querySelector("#evidenceText"),
   evidenceConfidence: document.querySelector("#evidenceConfidence"),
   saveEvidence: document.querySelector("#saveEvidence"),
+  notesText: document.querySelector("#notesText"),
+  saveNotes: document.querySelector("#saveNotes"),
+  reviewRecallText: document.querySelector("#reviewRecallText"),
   accountPanel: document.querySelector("#accountPanel"),
   cloudModeBadge: document.querySelector("#cloudModeBadge"),
   accountOpen: document.querySelector("#accountOpen"),
@@ -88,6 +107,22 @@ function loadAppConfig() {
     ...Object.fromEntries(Object.entries(local).filter(([, value]) => String(value || "").trim())),
     supabaseModuleUrl: local.supabaseModuleUrl || base.supabaseModuleUrl || "https://esm.sh/@supabase/supabase-js@2",
   };
+}
+
+function loadUiState() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_UI_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function saveUiState(extra = {}) {
+  const current = loadUiState();
+  localStorage.setItem(
+    LOCAL_UI_KEY,
+    JSON.stringify({ ...current, lessonId: state.currentLessonId, tab: state.tab, ...extra, updatedAt: nowIso() }),
+  );
 }
 
 function hasLocalCloudConfig() {
@@ -120,16 +155,17 @@ async function init() {
   state.dashboard = await apiGet("dashboard");
   state.masteryReport = await apiGet("mastery-report");
   state.studyPlan = await apiGet("study-plan");
-  state.currentLessonId = state.data.lessons[0].id;
-  state.activeLab = state.data.labs[0].id;
-  state.activeQuiz = state.data.quizzes[0].id;
+  if (!state.data.lessons.some((lesson) => lesson.id === state.currentLessonId)) state.currentLessonId = state.data.lessons[0].id;
+  if (!document.querySelector(`.tab[data-tab="${state.tab}"]`)) state.tab = "overview";
   state.completed = completedFromServer(state.serverState);
 
   renderControls();
+  document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === state.tab));
   renderPhases();
   renderLesson();
   renderLab();
   renderQuiz();
+  loadCurrentNotes();
   renderLearningConsole();
   renderAccountPanel();
   updateProgress();
@@ -141,6 +177,7 @@ function attachEvents() {
     button.addEventListener("click", () => {
       state.tab = button.dataset.tab;
       document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab === button));
+      saveUiState();
       renderLesson();
     });
   });
@@ -170,6 +207,12 @@ function attachEvents() {
     updateProgress();
   });
 
+  els.mobileCurriculumToggle?.addEventListener("click", () => {
+    const expanded = els.sidebar?.classList.toggle("mobile-expanded") || false;
+    els.mobileCurriculumToggle.setAttribute("aria-expanded", String(expanded));
+    els.mobileCurriculumToggle.textContent = expanded ? "收起目录" : "展开目录";
+  });
+
   els.searchInput.addEventListener("input", () => renderPhases(els.searchInput.value));
   els.labSelect.addEventListener("change", () => {
     state.activeLab = els.labSelect.value;
@@ -186,6 +229,7 @@ function attachEvents() {
   });
   els.refreshDashboard.addEventListener("click", refreshLearningState);
   els.saveEvidence.addEventListener("click", submitEvidence);
+  els.saveNotes?.addEventListener("click", saveCurrentNotes);
   els.accountOpen?.addEventListener("click", openAccountModal);
   els.accountModal?.addEventListener("click", (event) => {
     if (event.target === els.accountModal || event.target.closest("[data-account-close]")) closeAccountModal();
@@ -222,8 +266,15 @@ async function apiPost(name, payload) {
         body: JSON.stringify(payload),
       });
       const contentType = response.headers.get("content-type") || "";
-      if (response.ok && contentType.includes("application/json")) return response.json();
-    } catch {
+      if (contentType.includes("application/json")) {
+        const result = await response.json();
+        if (response.ok) return result;
+        const error = new Error(result.error || `请求失败（${response.status}）`);
+        error.name = "ApiResponseError";
+        throw error;
+      }
+    } catch (error) {
+      if (error?.name === "ApiResponseError") throw error;
       // Switch to browser-local persistence when the API is unavailable.
     }
     state.apiMode = "static";
@@ -264,7 +315,7 @@ async function staticPost(name, payload) {
   const localState = loadBrowserState();
   if (name === "profile") updateLocalProfile(localState, payload);
   if (name === "progress") updateLocalProgress(localState, payload);
-  if (name === "quiz-attempt") addLocalQuizAttempt(localState, payload);
+  if (name === "quiz-attempt") addLocalQuizAttempt(localState, payload, curriculum);
   if (name === "evidence") addLocalEvidence(localState, payload);
   if (name === "review") addLocalReview(localState, payload);
   if (name === "notes") saveLocalNote(localState, payload);
@@ -329,13 +380,13 @@ async function hydrateCloudState() {
     const localState = loadBrowserState();
     const remoteState = await fetchCloudState();
     if (!remoteState) {
-      await saveCloudState(localState);
+      await saveCloudState(localState, { mergeRemote: false });
       state.cloud.message = "已创建云端学习档案。";
       return;
     }
     const merged = mergeLearningStates(localState, remoteState);
     saveBrowserState(merged);
-    await saveCloudState(merged);
+    await saveCloudState(merged, { mergeRemote: false });
     state.cloud.message = "云端学习状态已合并。";
   } catch (error) {
     state.cloud.error = readableError(error);
@@ -360,14 +411,22 @@ async function fetchCloudState() {
   return data?.state || null;
 }
 
-async function saveCloudState(nextState) {
+async function saveCloudState(nextState, { mergeRemote = true } = {}) {
   if (!canUseCloud()) return;
   state.cloud.syncing = true;
   state.cloud.error = "";
   try {
+    let stateToSave = nextState;
+    if (mergeRemote) {
+      const remoteState = await fetchCloudState();
+      if (remoteState) {
+        stateToSave = mergeLearningStates(nextState, remoteState);
+        saveBrowserState(stateToSave);
+      }
+    }
     const payload = {
       user_id: state.cloud.user.id,
-      state: nextState,
+      state: stateToSave,
       updated_at: nowIso(),
     };
     const { error } = await state.cloud.client.from("learning_states").upsert(payload, { onConflict: "user_id" });
@@ -553,16 +612,30 @@ function updateLocalProgress(localState, payload) {
   recordLocalEvent(localState, "progressed", lessonId, "lesson", { progress });
 }
 
-function addLocalQuizAttempt(localState, payload) {
-  const score = Number(payload.score || 0);
-  const total = Number(payload.total || 0);
+function addLocalQuizAttempt(localState, payload, curriculum) {
+  const quiz = curriculum.quizzes.find((item) => item.id === payload.quiz_id);
+  if (!quiz) throw new Error("未知测验，无法保存成绩。");
+  if (quiz.lesson_id !== payload.lesson_id) throw new Error("测验与当前课程不匹配。");
+  const submitted = Array.isArray(payload.answers) ? payload.answers : [];
+  const selectedByIndex = new Map(submitted.map((item, index) => [Number(item.question_index ?? index), Number(item.selected)]));
+  const answers = quiz.questions.map((question, questionIndex) => {
+    const selected = selectedByIndex.has(questionIndex) ? selectedByIndex.get(questionIndex) : null;
+    return {
+      question_index: questionIndex,
+      question: question.prompt,
+      selected,
+      is_correct: selected === question.answer,
+    };
+  });
+  const score = answers.filter((answer) => answer.is_correct).length;
+  const total = quiz.questions.length;
   const attempt = {
     id: cryptoId(),
     quiz_id: payload.quiz_id,
     lesson_id: payload.lesson_id,
     score,
     total,
-    answers: payload.answers || [],
+    answers,
     percent: Math.round((100 * score) / Math.max(1, total)),
     created_at: nowIso(),
   };
@@ -589,6 +662,8 @@ function addLocalEvidence(localState, payload) {
 function addLocalReview(localState, payload) {
   const lessonId = payload.lesson_id;
   const quality = payload.quality || "good";
+  const recallText = String(payload.recall_text || "").trim();
+  if (recallText.length < 30) throw new Error("闭卷回忆至少需要 30 个字符。");
   const current = localState.reviews[lessonId] || {};
   const interval = nextInterval(Number(current.interval_days || 0), quality);
   const review = {
@@ -598,6 +673,7 @@ function addLocalReview(localState, payload) {
     last_reviewed_at: nowIso(),
     due_at: new Date(Date.now() + interval * 86400000).toISOString(),
     count: Number(current.count || 0) + 1,
+    recall_text: recallText,
   };
   localState.reviews[lessonId] = review;
   recordLocalEvent(localState, "reviewed", lessonId, "lesson", { review });
@@ -702,12 +778,12 @@ function buildLearningModel(curriculum) {
     cycle: [
       { id: "diagnose", title: "诊断", description: "先确认基础能力和学习目标。" },
       { id: "learn", title: "学习", description: "按官方课程顺序学习概念、数学和代码。" },
-      { id: "practice", title: "实验", description: "用玩具实验把公式变成可观察结果。" },
       { id: "check", title: "自测", description: "用形成性测验发现误解。" },
+      { id: "practice", title: "实践", description: "在浏览器 CPU 环境实现核心算法并通过测试。" },
       { id: "evidence", title: "证据", description: "写出解释、伪代码或实验分析。" },
       { id: "review", title: "复习", description: "按间隔复习巩固薄弱单元。" },
     ],
-    rubric: { progress: 35, quiz: 20, evidence: 20, review: 15, diagnostic: 10 },
+    rubric: { progress: 10, quiz: 25, practice: 30, evidence: 20, review: 15 },
   };
 }
 
@@ -715,8 +791,8 @@ function buildKnowledgeGraph(curriculum) {
   const nodes = COMPETENCIES.map((competency) => ({ id: competency.id, type: "competency", title: competency.title }));
   const edges = [];
   const lessonById = new Map(curriculum.lessons.map((lesson) => [lesson.id, lesson]));
+  let previous = null;
   curriculum.roadmap.forEach((phase) => {
-    let previous = null;
     phase.lessons.forEach((lessonId, index) => {
       const lesson = lessonById.get(lessonId);
       if (!lesson) return;
@@ -740,7 +816,7 @@ function buildKnowledgeGraph(curriculum) {
 function buildDashboard(curriculum, localState) {
   const progress = localState.lesson_progress || {};
   const completed = Object.entries(progress).filter(([, item]) => ["completed", "mastered"].includes(item.status)).map(([id]) => id);
-  const mastered = Object.entries(progress).filter(([, item]) => item.status === "mastered").map(([id]) => id);
+  const mastered = curriculum.lessons.map((lesson) => lessonMasteryRow(lesson, localState)).filter((row) => row.score >= 90).map((row) => row.lesson_id);
   const phaseProgress = curriculum.roadmap.map((phase) => {
     const done = phase.lessons.filter((lessonId) => ["completed", "mastered"].includes(progress[lessonId]?.status)).length;
     return { id: phase.id, title: phase.title, done, total: phase.lessons.length, percent: Math.round((100 * done) / Math.max(1, phase.lessons.length)) };
@@ -795,8 +871,10 @@ function computeNextActions(curriculum, localState) {
   const due = buildReviewQueue(curriculum, localState);
   if (due.length) actions.push({ type: "review", title: `复习：${due[0].lecture} · ${due[0].title}`, lesson_id: due[0].lesson_id, reason: "间隔复习到期，先巩固再学新内容。" });
 
-  const nextLesson = curriculum.lessons.find((lesson) => !["completed", "mastered"].includes(localState.lesson_progress[lesson.id]?.status));
-  if (nextLesson) actions.push({ type: "learn", title: `继续学习：${nextLesson.lecture} · ${nextLesson.title}`, lesson_id: nextLesson.id, reason: "这是当前路径中第一个未完成单元。" });
+  const nextLesson = curriculum.lessons
+    .map((lesson) => ({ lesson, row: lessonMasteryRow(lesson, localState) }))
+    .find(({ row }) => row.score < 75);
+  if (nextLesson) actions.push({ type: "learn", title: `继续学习：${nextLesson.lesson.lecture} · ${nextLesson.lesson.title}`, lesson_id: nextLesson.lesson.id, reason: nextLesson.row.next_step });
 
   const weakQuiz = weakestQuizArea(curriculum, localState);
   if (weakQuiz) actions.push(weakQuiz);
@@ -848,16 +926,17 @@ function masterySnapshot(curriculum, localState) {
 function lessonMasteryRow(lesson, localState) {
   const lessonId = lesson.id;
   const progress = localState.lesson_progress[lessonId] || {};
-  const progressPoints = { not_started: 0, in_progress: 15, completed: 30, mastered: 35 }[progress.status || "not_started"] || 0;
+  const progressPoints = { not_started: 0, in_progress: 3, completed: 7, mastered: 10 }[progress.status || "not_started"] || 0;
   const quiz = latestQuizForLesson(localState, lessonId);
-  const quizPoints = quiz ? Math.round((quiz.percent / 100) * 20) : 0;
+  const quizPoints = quiz ? Math.round((quiz.percent / 100) * 25) : 0;
+  const practice = bestPracticeForLesson(localState, lessonId);
+  const practicePoints = practice ? Math.round((practice.percent / 100) * 30) : 0;
   const evidence = bestEvidenceForLesson(localState, lessonId);
   const evidencePoints = evidencePointsFor(evidence);
   const review = localState.reviews[lessonId];
-  let reviewPoints = review ? Math.min(15, Number(review.count || 0) * 5) : 0;
-  if (review?.quality === "easy") reviewPoints = Math.min(15, reviewPoints + 3);
-  const diagnosticPoints = diagnosticPointsForLesson(localState, lessonId);
-  const score = Math.min(100, progressPoints + quizPoints + evidencePoints + reviewPoints + diagnosticPoints);
+  let reviewPoints = review && String(review.recall_text || "").length >= 30 ? Math.min(15, Number(review.count || 0) * 4) : 0;
+  if (reviewPoints && review?.quality === "easy") reviewPoints = Math.min(15, reviewPoints + 1);
+  const score = Math.min(100, progressPoints + quizPoints + practicePoints + evidencePoints + reviewPoints);
   return {
     lesson_id: lessonId,
     title: lesson.title,
@@ -866,11 +945,12 @@ function lessonMasteryRow(lesson, localState) {
     competencies: LESSON_COMPETENCIES[lessonId] || [],
     score,
     status: scoreStatus(score),
-    components: { progress: progressPoints, quiz: quizPoints, evidence: evidencePoints, review: reviewPoints, diagnostic: diagnosticPoints },
+    components: { progress: progressPoints, quiz: quizPoints, practice: practicePoints, evidence: evidencePoints, review: reviewPoints },
     latest_quiz_percent: quiz?.percent ?? null,
+    latest_practice_percent: practice?.percent ?? null,
     evidence_ready: Boolean(evidence?.quality?.ready_for_review),
     review_count: Number(review?.count || 0),
-    next_step: lessonNextStep(score, progress.status || "not_started", quiz, evidence, review),
+    next_step: lessonNextStep(score, progress.status || "not_started", quiz, practice, evidence, review),
   };
 }
 
@@ -884,7 +964,7 @@ function competencyMasteryRows(localState, lessonRows) {
       .filter(Boolean);
     const lessonScore = Math.round(rows.reduce((sum, row) => sum + row.score, 0) / Math.max(1, rows.length));
     const diagnosticScore = diagnosticScores[competency.id] ?? null;
-    const score = diagnosticScore == null ? Math.round(lessonScore * 0.85) : Math.round(lessonScore * 0.7 + diagnosticScore * 0.3);
+    const score = lessonScore;
     return {
       id: competency.id,
       title: competency.title,
@@ -899,18 +979,26 @@ function competencyMasteryRows(localState, lessonRows) {
 }
 
 function buildStudyPlan(curriculum, localState, weeks = 4) {
-  const weekCount = Math.max(1, Math.min(8, Number(weeks || 4)));
-  const weeklyHours = Number(localState.profile.weekly_hours || 10);
+  const profile = localState.profile || {};
+  const weeklyHours = Number(profile.weekly_hours || 10);
   const sessionsPerWeek = Math.max(3, Math.min(7, Math.round((weeklyHours * 60) / 70)));
   const rowsById = new Map(curriculum.lessons.map((lesson) => [lesson.id, lessonMasteryRow(lesson, localState)]));
   const pending = curriculum.lessons.filter((lesson) => rowsById.get(lesson.id).score < 75);
+  const targetDate = String(profile.target_date || "");
+  let availableWeeks = null;
+  if (targetDate) {
+    const deadline = new Date(`${targetDate}T23:59:59`);
+    if (!Number.isNaN(deadline.getTime())) availableWeeks = Math.max(1, Math.ceil(Math.max(0, deadline.getTime() - Date.now()) / 604800000));
+  }
+  const weekCount = Math.max(1, Math.min(8, availableWeeks || Number(weeks || 4)));
+  const paceStatus = weekCount * sessionsPerWeek >= pending.length ? "on_track" : "over_capacity";
   const due = buildReviewQueue(curriculum, localState);
   const output = [];
   let cursor = 0;
   for (let weekIndex = 0; weekIndex < weekCount; weekIndex += 1) {
     const sessions = [];
     if (weekIndex === 0) {
-      due.slice(0, 2).forEach((review) => sessions.push({ type: "review", title: `复习：${review.lecture} · ${review.title}`, lesson_id: review.lesson_id, minutes: 25, activities: ["回忆公式/代码路径", "用 again/hard/good/easy 记录复习质量"] }));
+      due.slice(0, 2).forEach((review) => sessions.push({ type: "review", title: `复习：${review.lecture} · ${review.title}`, lesson_id: review.lesson_id, minutes: 25, activities: ["先闭卷写回忆答案", "再对照公式/代码路径纠错", "记录复习质量"] }));
     }
     while (sessions.length < sessionsPerWeek && cursor < pending.length) {
       const lesson = pending[cursor];
@@ -925,9 +1013,14 @@ function buildStudyPlan(curriculum, localState, weeks = 4) {
   }
   return {
     generated_at: nowIso(),
+    goal: profile.goal || "",
+    level: profile.level || "beginner",
+    target_date: targetDate,
+    pace_status: paceStatus,
+    remaining_lessons: pending.length,
     weekly_hours: weeklyHours,
     sessions_per_week: sessionsPerWeek,
-    rules: ["分数低于 75 的单元优先进入计划。", "到期复习在每周第一批 session 中优先安排。", "每个新单元必须覆盖概念、数学、代码和产出证据。"],
+    rules: ["分数低于 75 的单元优先进入计划。", "到期复习在每周第一批 session 中优先安排。", "每个新单元必须覆盖概念、数学、代码和产出证据。", "诊断只调整提示和优先级，不直接增加掌握分。"],
     weeks: output,
   };
 }
@@ -977,7 +1070,19 @@ function bestEvidenceForLesson(localState, lessonId) {
 function evidencePointsFor(evidence) {
   if (!evidence) return 0;
   const quality = evidence.quality || {};
-  return Math.min(20, Number(quality.length_score || 0) * 4 + Number(quality.confidence_score || 0) * 2 + (quality.ready_for_review ? 2 : 0));
+  return Math.min(20, Number(quality.length_score || 0) * 4 + Number(quality.rubric_score || 0) * 3);
+}
+
+function bestPracticeForLesson(localState, lessonId) {
+  const attempts = (localState.lab_attempts || [])
+    .filter((item) => item.lesson_id === lessonId && String(item.lab_id || "").startsWith("studio:"))
+    .map((item) => {
+      const total = Number(item.metrics?.total || 0);
+      const passed = Number(item.metrics?.passed || 0);
+      return total > 0 ? { ...item, percent: Math.round((100 * passed) / total) } : null;
+    })
+    .filter(Boolean);
+  return attempts.sort((a, b) => b.percent - a.percent)[0] || null;
 }
 
 function diagnosticScoresByCompetency(localState) {
@@ -1009,10 +1114,18 @@ function learningBlockers(curriculum, localState, lessonRows, competencyRows) {
 }
 
 function scoreEvidence(text, confidence) {
-  const length = String(text || "").length;
-  const lengthScore = length >= 600 ? 3 : length >= 300 ? 2 : length >= 120 ? 1 : 0;
+  const normalized = String(text || "").trim();
+  const lower = normalized.toLowerCase();
+  const dimensions = {
+    reasoning: ["因为", "所以", "因此", "前提", "because", "therefore"].some((token) => lower.includes(token)),
+    math_or_shape: /[=<>]|\b(shape|softmax|loss|flops|bytes|kl)\b|概率|公式|维度/.test(lower),
+    implementation: ["代码", "伪代码", "def ", "tensor", "变量", "实验", "test", "assert"].some((token) => lower.includes(token)),
+    boundary: ["近似", "限制", "失败", "误区", "风险", "边界", "不能", "不等于"].some((token) => lower.includes(token)),
+  };
+  const lengthScore = normalized.length >= 300 ? 2 : normalized.length >= 160 ? 1 : 0;
+  const rubricScore = Object.values(dimensions).filter(Boolean).length;
   const confidenceScore = Math.max(0, Math.min(3, Number(confidence || 0)));
-  return { length_score: lengthScore, confidence_score: confidenceScore, ready_for_review: lengthScore >= 2 && confidenceScore >= 2 };
+  return { length_score: lengthScore, confidence_score: confidenceScore, rubric_score: rubricScore, dimensions, ready_for_review: lengthScore >= 1 && rubricScore >= 3 };
 }
 
 function nextInterval(previous, quality) {
@@ -1030,10 +1143,12 @@ function scoreStatus(score) {
   return "薄弱";
 }
 
-function lessonNextStep(score, progressStatus, quiz, evidence, review) {
+function lessonNextStep(score, progressStatus, quiz, practice, evidence, review) {
   if (progressStatus === "not_started") return "先读总览，再完成数学和代码页面的逐条讲解。";
   if (!quiz) return "完成形成性自测，让系统知道误解在哪里。";
   if (quiz.percent < 80) return "重做测验，并把错题写成一条笔记。";
+  if (!practice) return "完成本讲 CPU 实践任务，并通过自动测试。";
+  if (practice.percent < 100) return "修复实践任务中的失败测试，再解释错误原因。";
   if (!evidence?.quality?.ready_for_review) return "提交一份包含公式、shape 或伪代码的掌握证据。";
   if (!review) return "做一次间隔复习，确认不是短期记忆。";
   if (score < 75) return "回到官方材料，对照本项目解释补齐薄弱点。";
@@ -1041,8 +1156,8 @@ function lessonNextStep(score, progressStatus, quiz, evidence, review) {
 }
 
 function activitiesForScore(score) {
-  if (score < 25) return ["读总览", "列出核心概念", "手抄并解释公式符号", "运行对应互动实验"];
-  if (score < 50) return ["逐行读代码", "完成互动实验", "做形成性自测", "记录错题"];
+  if (score < 25) return ["读总览", "列出核心概念", "手抄并解释公式符号", "运行 CPU 实践任务"];
+  if (score < 50) return ["逐行读代码", "通过 CPU 实践测试", "做本讲形成性自测", "记录错题"];
   if (score < 75) return ["补掌握证据", "复习错题", "对照官方材料修正理解"];
   return ["间隔复习", "把本讲内容讲给未来的自己", "进入下一讲"];
 }
@@ -1056,12 +1171,21 @@ function cryptoId() {
 }
 
 function renderControls() {
-  els.labSelect.innerHTML = state.data.labs
-    .map((lab) => `<option value="${lab.id}">${escapeHtml(lab.title)}</option>`)
-    .join("");
-  els.quizSelect.innerHTML = state.data.quizzes
-    .map((quiz) => `<option value="${quiz.id}">${escapeHtml(quiz.title)}</option>`)
-    .join("");
+  const lessonId = state.currentLessonId;
+  const labs = state.data.labs.filter((lab) => lab.lesson === lessonId);
+  const quiz = state.data.quizzes.find((item) => item.lesson_id === lessonId);
+  state.activeLab = labs[0]?.id || "";
+  state.activeQuiz = quiz?.id || "";
+  state.quizSelections = {};
+  state.quizSubmitted = false;
+  els.labSelect.disabled = !labs.length;
+  els.labSelect.innerHTML = labs.length
+    ? labs.map((lab) => `<option value="${lab.id}">${escapeHtml(lab.title)}</option>`).join("")
+    : `<option value="">本讲无独立可视化实验</option>`;
+  els.quizSelect.disabled = !quiz;
+  els.quizSelect.innerHTML = quiz
+    ? `<option value="${quiz.id}">${escapeHtml(quiz.title)}</option>`
+    : `<option value="">本讲题库待补充</option>`;
 }
 
 function renderPhases(filter = "") {
@@ -1106,9 +1230,15 @@ function renderPhases(filter = "") {
     button.addEventListener("click", () => {
       state.currentLessonId = button.dataset.lesson;
       state.tab = "overview";
+      saveUiState();
       document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === "overview"));
+      renderControls();
       renderPhases(els.searchInput.value);
       renderLesson();
+      renderLab();
+      renderQuiz();
+      loadCurrentNotes();
+      closeMobileCurriculum();
     });
   });
 }
@@ -1133,11 +1263,18 @@ function renderLesson() {
   }
 }
 
+function closeMobileCurriculum() {
+  if (!els.sidebar || !els.mobileCurriculumToggle) return;
+  els.sidebar.classList.remove("mobile-expanded");
+  els.mobileCurriculumToggle.setAttribute("aria-expanded", "false");
+  els.mobileCurriculumToggle.textContent = "展开目录";
+}
+
 function renderLessonHeader() {
   const lesson = getCurrentLesson();
   els.lessonMeta.textContent = lesson.lecture;
   els.lessonTitle.textContent = lesson.title;
-  els.markDone.textContent = state.completed.has(lesson.id) ? "取消完成" : "标记完成";
+  els.markDone.textContent = state.completed.has(lesson.id) ? "取消阅读完成" : "完成阅读";
 }
 
 function renderOverview(lesson) {
@@ -1351,8 +1488,9 @@ async function initPdfReader(material) {
   const status = document.querySelector("#pdfReaderStatus");
   const images = Array.isArray(material.page_images) ? material.page_images : [];
   state.sourceReader.pdfImages = images;
-  state.sourceReader.page = images.length ? 1 : 0;
-  state.sourceReader.scale = 1;
+  const ui = loadUiState();
+  state.sourceReader.page = images.length ? Number(ui.pdfPages?.[state.currentLessonId] || 1) : 0;
+  state.sourceReader.scale = Number(ui.pdfScales?.[state.currentLessonId] || 1);
   document.querySelector("#pdfPageCount").textContent = String(images.length);
   if (!images.length) {
     if (status) status.textContent = "PDF 未自动加载；等待构建产物生成图片页。";
@@ -1377,6 +1515,11 @@ async function renderPdfPage() {
   status.textContent = `第 ${pageNumber} 页 / 共 ${images.length} 页，缩放 ${zoomPercent}%`;
   document.querySelector("#pdfPageNumber").textContent = String(pageNumber);
   document.querySelector("#pdfPageCount").textContent = String(images.length);
+  const ui = loadUiState();
+  saveUiState({
+    pdfPages: { ...(ui.pdfPages || {}), [state.currentLessonId]: pageNumber },
+    pdfScales: { ...(ui.pdfScales || {}), [state.currentLessonId]: state.sourceReader.scale },
+  });
 }
 
 async function changePdfPage(delta) {
@@ -1405,7 +1548,7 @@ async function initTraceReader(lesson, material) {
     state.sourceReader.traceSections = parsed.sections;
     state.sourceReader.traceSource = source;
     state.sourceReader.traceMeta = parsed.meta;
-    renderTraceMode("lecture", lesson);
+    renderTraceMode(loadUiState().traceModes?.[lesson.id] || "lecture", lesson);
   } catch (error) {
     body.innerHTML = `
       <div class="material-placeholder">
@@ -1806,6 +1949,10 @@ function renderTraceMode(mode, lesson) {
   const body = document.querySelector("#traceReaderBody");
   const status = document.querySelector("#traceReaderStatus");
   if (!body) return;
+  const supportedMode = ["lecture", "images", "source"].includes(mode) ? mode : "lecture";
+  mode = supportedMode;
+  const ui = loadUiState();
+  saveUiState({ traceModes: { ...(ui.traceModes || {}), [lesson.id]: mode } });
   document.querySelectorAll("[data-trace-mode]").forEach((button) => button.classList.toggle("active", button.dataset.traceMode === mode));
   const entries = state.sourceReader.traceEntries || [];
   const sections = state.sourceReader.traceSections || [];
@@ -2082,6 +2229,8 @@ function renderCode(lesson) {
 }
 
 function renderPractice(lesson) {
+  const studios = (state.data.practice_studios || []).filter((task) => task.lesson_ids.includes(lesson.id));
+  if (!studios.some((task) => task.id === state.practice.taskId)) state.practice.taskId = studios[0]?.id || "";
   els.lessonBody.innerHTML = `
     <div class="content-grid">
       <section>
@@ -2090,6 +2239,24 @@ function renderPractice(lesson) {
           ${lesson.practice.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
         </ul>
       </section>
+      ${
+        studios.length
+          ? `<section class="studio-shell">
+              <div class="studio-head">
+                <div>
+                  <p class="eyebrow">CPU PRACTICE · ${escapeHtml(studios[0].assignment_id.toUpperCase())}</p>
+                  <h3>浏览器 Python 实践</h3>
+                </div>
+                <label class="studio-select-label">任务
+                  <select id="studioSelect">
+                    ${studios.map((task) => `<option value="${escapeHtml(task.id)}" ${task.id === state.practice.taskId ? "selected" : ""}>${escapeHtml(task.title)}</option>`).join("")}
+                  </select>
+                </label>
+              </div>
+              <div id="studioTask"></div>
+            </section>`
+          : `<section class="info-band"><h3>本讲实践路径</h3><p>本讲没有独立编码任务，请完成上面的推导练习与右侧可视化实验；掌握度中的实践项会由相邻课程的综合任务覆盖。</p></section>`
+      }
       <section>
         <h3>术语速查</h3>
         <ul class="glossary-list">
@@ -2102,6 +2269,174 @@ function renderPractice(lesson) {
       </section>
     </div>
   `;
+  if (studios.length) {
+    document.querySelector("#studioSelect").addEventListener("change", (event) => {
+      state.practice.taskId = event.target.value;
+      renderPracticeTask(studios.find((task) => task.id === state.practice.taskId));
+    });
+    renderPracticeTask(studios.find((task) => task.id === state.practice.taskId));
+  }
+}
+
+function renderPracticeTask(task) {
+  const host = document.querySelector("#studioTask");
+  if (!host || !task) return;
+  const savedCode = loadStudioCode()[task.id] || task.starter_code;
+  const testNames = [...task.test_code.matchAll(/_expect(?:_close|_sequence_close|_raises)?\(\s*["']([^"']+)/g)].map((match) => match[1]);
+  host.innerHTML = `
+    <div class="studio-brief">
+      <div>
+        <h4>${escapeHtml(task.title)}</h4>
+        <p>${escapeHtml(task.objective)}</p>
+      </div>
+      <span class="status-badge">${escapeHtml(task.assignment_id.toUpperCase())}</span>
+    </div>
+    <div class="studio-learning-grid">
+      <div>
+        <strong>实现思路</strong>
+        <ol>${task.hints.map((hint) => `<li>${escapeHtml(hint)}</li>`).join("")}</ol>
+      </div>
+      <div>
+        <strong>自动检查</strong>
+        <ul>${testNames.map((name) => `<li>${escapeHtml(name)}</li>`).join("")}</ul>
+      </div>
+    </div>
+    ${editorShell("studioEditor", task.title, "Python 3 · Pyodide", savedCode, Math.max(10, savedCode.split("\n").length + 2))}
+    <div class="studio-actions">
+      <button id="studioRun" class="secondary-button" type="button">运行自动测试</button>
+      <button id="studioReset" class="ghost-button" type="button">恢复起始代码</button>
+      <span id="studioRuntimeStatus" class="small-text">首次运行会加载约 10 MB 的固定版本 Python 运行时。</span>
+    </div>
+    <div id="studioOutput" class="studio-output" aria-live="polite"><span>测试结果会显示在这里。</span></div>
+    <details class="studio-tests">
+      <summary>查看测试代码与解释</summary>
+      <p class="small-text">测试先验证输入输出契约，再覆盖数值稳定性或边界条件。通过测试只能证明这些例子正确，不能替代你对算法的解释。</p>
+      ${codePanel(task.test_code, "python", "公开测试")}
+    </details>
+  `;
+  const editor = document.querySelector("#studioEditor");
+  editor.addEventListener("input", () => saveStudioCode(task.id, editor.value));
+  editor.addEventListener("keydown", handleEditorTab);
+  document.querySelector("#studioRun").addEventListener("click", () => runPracticeTask(task));
+  document.querySelector("#studioReset").addEventListener("click", () => {
+    editor.value = task.starter_code;
+    saveStudioCode(task.id, task.starter_code);
+    document.querySelector("#studioOutput").innerHTML = `<span>已恢复起始代码，尚未运行测试。</span>`;
+  });
+}
+
+function loadStudioCode() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_STUDIO_CODE_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function saveStudioCode(taskId, code) {
+  localStorage.setItem(LOCAL_STUDIO_CODE_KEY, JSON.stringify({ ...loadStudioCode(), [taskId]: code }));
+}
+
+function handleEditorTab(event) {
+  if (event.key !== "Tab") return;
+  event.preventDefault();
+  const textarea = event.currentTarget;
+  const start = textarea.selectionStart;
+  textarea.setRangeText("    ", start, textarea.selectionEnd, "end");
+  textarea.dispatchEvent(new Event("input"));
+}
+
+function resetPracticeWorker() {
+  state.practice.worker?.terminate();
+  state.practice.worker = null;
+  state.practice.ready = false;
+  state.practice.readyPromise = null;
+  state.practice.pending.forEach(({ reject }) => reject(new Error("Python 运行时已重置。")));
+  state.practice.pending.clear();
+}
+
+function callPracticeWorker(message, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const id = cryptoId();
+    const timeout = window.setTimeout(() => {
+      state.practice.pending.delete(id);
+      resetPracticeWorker();
+      reject(new Error("执行超时，运行时已重置。请检查是否存在无限循环。"));
+    }, timeoutMs);
+    state.practice.pending.set(id, {
+      resolve: (result) => {
+        window.clearTimeout(timeout);
+        resolve(result);
+      },
+      reject: (error) => {
+        window.clearTimeout(timeout);
+        reject(error);
+      },
+    });
+    state.practice.worker.postMessage({ ...message, id });
+  });
+}
+
+async function ensurePracticeWorker() {
+  if (state.practice.ready) return;
+  if (state.practice.readyPromise) return state.practice.readyPromise;
+  state.practice.worker = new Worker("./pyodide-worker.js?v=20260710b");
+  state.practice.worker.addEventListener("message", (event) => {
+    const pending = state.practice.pending.get(event.data.id);
+    if (!pending) return;
+    state.practice.pending.delete(event.data.id);
+    if (event.data.ok) pending.resolve(event.data);
+    else pending.reject(new Error(event.data.error || "Python 执行失败。"));
+  });
+  state.practice.worker.addEventListener("error", (event) => {
+    state.practice.pending.forEach(({ reject }) => reject(new Error(event.message || "无法加载 Python 运行时。")));
+    resetPracticeWorker();
+  });
+  state.practice.readyPromise = callPracticeWorker({ type: "init" }, 60000).then(() => {
+    state.practice.ready = true;
+  });
+  return state.practice.readyPromise;
+}
+
+async function runPracticeTask(task) {
+  if (state.practice.running) return;
+  const editor = document.querySelector("#studioEditor");
+  const button = document.querySelector("#studioRun");
+  const status = document.querySelector("#studioRuntimeStatus");
+  const output = document.querySelector("#studioOutput");
+  if (!editor || !button || !output) return;
+  state.practice.running = true;
+  button.disabled = true;
+  status.textContent = state.practice.ready ? "正在隔离环境中执行..." : "正在加载固定版本 Python 运行时...";
+  output.innerHTML = `<span class="studio-running">正在运行公开测试...</span>`;
+  saveStudioCode(task.id, editor.value);
+  try {
+    await ensurePracticeWorker();
+    const result = await callPracticeWorker({ type: "run", code: editor.value, tests: task.test_code }, 10000);
+    const allPassed = result.total > 0 && result.passed === result.total;
+    output.innerHTML = `
+      <div class="studio-result-head ${allPassed ? "passed" : "failed"}">
+        <strong>${allPassed ? "全部通过" : "仍需修正"}</strong>
+        <span>${result.passed}/${result.total}</span>
+      </div>
+      ${(result.tests || []).map((test) => `<div class="studio-test-row ${test.passed ? "passed" : "failed"}"><span>${test.passed ? "PASS" : "FAIL"}</span><strong>${escapeHtml(test.name)}</strong><code>${escapeHtml(test.detail || "")}</code></div>`).join("")}
+      ${result.stdout?.length ? `<pre>${escapeHtml(result.stdout.join("\n"))}</pre>` : ""}
+    `;
+    status.textContent = allPassed ? "结果已作为本讲实践证据记录。" : "失败信息已给出；修复后重新运行。";
+    await postJson("lab-attempt", {
+      lab_id: `studio:${task.id}`,
+      lesson_id: state.currentLessonId,
+      summary: `${task.title}: ${result.passed}/${result.total} tests passed`,
+      metrics: { task_id: task.id, passed: result.passed, total: result.total },
+    });
+    await refreshLearningState(false);
+  } catch (error) {
+    output.innerHTML = `<div class="studio-error"><strong>执行失败</strong><pre>${escapeHtml(readableError(error))}</pre></div>`;
+    status.textContent = "运行时不可用或代码执行失败；代码已保存在本机。";
+  } finally {
+    state.practice.running = false;
+    button.disabled = false;
+  }
 }
 
 function renderMap(lesson) {
@@ -2308,6 +2643,16 @@ function accountMarkup(context) {
   }
 
   if (!state.cloud.configured) {
+    if (context === "panel") {
+      return `
+        <div class="account-user local-account">
+          <strong>本机学习档案</strong>
+          <span>进度、证据与笔记保存在当前浏览器。</span>
+        </div>
+        <div class="cloud-facts"><span>离线可用</span><span>自动保存</span><span>未登录</span></div>
+        <button class="ghost-button account-config-open" type="button" data-account-open>配置账号与跨设备同步</button>
+      `;
+    }
     return `
       <div class="account-user local-account">
         <strong>本机学习档案</strong>
@@ -2325,6 +2670,9 @@ function accountMarkup(context) {
   }
 
   if (!state.cloud.client) {
+    if (context === "panel") {
+      return `<p class="small-text">云同步初始化失败。打开账号窗口查看错误并修正配置。</p><button class="ghost-button account-config-open" type="button" data-account-open>查看账号配置</button>`;
+    }
     return `
       <p class="small-text">云同步配置存在，但客户端初始化失败。</p>
       ${cloudMessageMarkup()}
@@ -2624,7 +2972,7 @@ function masteryReportMarkup(report) {
       <article class="mastery-score-card">
         <span>课程掌握度</span>
         <strong>${report.average_score}</strong>
-        <p>${escapeHtml(report.status)} · 评分由进度、测验、证据、复习和诊断组成。</p>
+        <p>${escapeHtml(report.status)} · 评分只来自阅读、自测、实践、解释证据和闭卷复习；自我诊断不加分。</p>
         ${componentRubric(report.rubric)}
       </article>
       <div class="weak-panel">
@@ -2640,10 +2988,11 @@ function masteryReportMarkup(report) {
 }
 
 function componentRubric(rubric) {
+  const labels = { progress: "阅读", quiz: "自测", practice: "实践", evidence: "证据", review: "复习" };
   return `
     <div class="rubric-grid">
       ${Object.entries(rubric)
-        .map(([key, value]) => `<span>${escapeHtml(key)} ${value}</span>`)
+        .map(([key, value]) => `<span>${escapeHtml(labels[key] || key)} ${value}</span>`)
         .join("")}
     </div>
   `;
@@ -2676,7 +3025,7 @@ function studyPlanMarkup(plan) {
     <div class="plan-shell">
       <div class="plan-rules">
         <strong>计划规则</strong>
-        <p class="small-text">每周 ${plan.weekly_hours} 小时，约 ${plan.sessions_per_week} 个学习 session。</p>
+        <p class="small-text">目标：${escapeHtml(plan.goal || "完成课程")} · 每周 ${plan.weekly_hours} 小时 · 剩余 ${plan.remaining_lessons ?? "-"} 讲 · ${plan.pace_status === "over_capacity" ? "当前时间预算不足" : "进度容量匹配"}</p>
         <ul>${plan.rules.map((rule) => `<li>${escapeHtml(rule)}</li>`).join("")}</ul>
       </div>
       <div class="study-plan-grid">
@@ -2825,10 +3174,14 @@ async function postJson(name, payload) {
 
 async function submitEvidence() {
   const text = els.evidenceText.value.trim();
-  if (!text) {
+  const quality = scoreEvidence(text, Number(els.evidenceConfidence.value));
+  if (text.length < 160 || quality.rubric_score < 3) {
+    els.evidenceText.setCustomValidity("至少写 160 个字符，并覆盖推理、公式/shape、代码/实验、边界中的三项。");
+    els.evidenceText.reportValidity();
     els.evidenceText.focus();
     return;
   }
+  els.evidenceText.setCustomValidity("");
   const lesson = getCurrentLesson();
   await postJson("evidence", {
     lesson_id: lesson.id,
@@ -2842,13 +3195,43 @@ async function submitEvidence() {
 }
 
 async function submitReview(quality) {
-  await postJson("review", { lesson_id: state.currentLessonId, quality });
+  const recallText = els.reviewRecallText.value.trim();
+  if (recallText.length < 30) {
+    els.reviewRecallText.setCustomValidity("请先闭卷写至少 30 个字符，再评价复习难度。");
+    els.reviewRecallText.reportValidity();
+    els.reviewRecallText.focus();
+    return;
+  }
+  els.reviewRecallText.setCustomValidity("");
+  await postJson("review", { lesson_id: state.currentLessonId, quality, recall_text: recallText });
+  els.reviewRecallText.value = "";
   await refreshLearningState();
+}
+
+function loadCurrentNotes() {
+  if (!els.notesText) return;
+  els.notesText.value = state.serverState?.notes?.[state.currentLessonId]?.text || "";
+}
+
+async function saveCurrentNotes() {
+  if (!els.notesText || !els.saveNotes) return;
+  const original = els.saveNotes.textContent;
+  els.saveNotes.disabled = true;
+  await postJson("notes", { lesson_id: state.currentLessonId, text: els.notesText.value });
+  await refreshLearningState(false);
+  els.saveNotes.textContent = "已保存";
+  window.setTimeout(() => {
+    els.saveNotes.textContent = original;
+    els.saveNotes.disabled = false;
+  }, 1200);
 }
 
 function renderLab() {
   const lab = state.data.labs.find((item) => item.id === state.activeLab);
-  if (!lab) return;
+  if (!lab) {
+    els.labPanel.innerHTML = `<p class="small-text">本讲的编码练习位于“实践”标签；可视化实验只在最适合观察变量变化的课程中提供。</p>`;
+    return;
+  }
   if (lab.id === "bpe") renderBpeLab(lab);
   if (lab.id === "attention") renderAttentionLab(lab);
   if (lab.id === "resources") renderResourcesLab(lab);
@@ -2964,7 +3347,10 @@ function renderAlignmentLab(lab) {
 
 function renderQuiz() {
   const quiz = state.data.quizzes.find((item) => item.id === state.activeQuiz);
-  state.quizSelections = {};
+  if (!quiz) {
+    els.quizPanel.innerHTML = `<p class="small-text">本讲暂无形成性测验。</p>`;
+    return;
+  }
   els.quizPanel.innerHTML = quiz.questions
     .map(
       (question, questionIndex) => `
@@ -2972,39 +3358,53 @@ function renderQuiz() {
         <p><strong>${questionIndex + 1}. ${escapeHtml(question.prompt)}</strong></p>
         <div class="quiz-options">
           ${question.options
-            .map((option, optionIndex) => `<button data-q="${questionIndex}" data-o="${optionIndex}" type="button">${escapeHtml(option)}</button>`)
+            .map((option, optionIndex) => `<button class="${state.quizSelections[questionIndex] === optionIndex ? "selected" : ""}" data-q="${questionIndex}" data-o="${optionIndex}" type="button">${escapeHtml(option)}</button>`)
             .join("")}
         </div>
         <div class="answer-note" id="answer-${questionIndex}"></div>
       </section>
     `,
     )
-    .join("") + `<button id="recordQuizAttempt" class="secondary-button" type="button">记录本次自测</button>`;
+    .join("") + `<button id="recordQuizAttempt" class="secondary-button" type="button" disabled>提交并查看解析</button>`;
 
   els.quizPanel.querySelectorAll("button[data-q]").forEach((button) => {
     button.addEventListener("click", () => {
       const q = Number(button.dataset.q);
       const o = Number(button.dataset.o);
-      const question = quiz.questions[q];
+      if (state.quizSubmitted) return;
       state.quizSelections[q] = o;
       const optionButtons = els.quizPanel.querySelectorAll(`button[data-q="${q}"]`);
-      optionButtons.forEach((item) => item.classList.remove("correct", "wrong"));
-      button.classList.add(o === question.answer ? "correct" : "wrong");
-      optionButtons[question.answer].classList.add("correct");
-      document.querySelector(`#answer-${q}`).textContent = question.explain;
+      optionButtons.forEach((item) => item.classList.toggle("selected", item === button));
+      document.querySelector("#recordQuizAttempt").disabled = Object.keys(state.quizSelections).length !== quiz.questions.length;
     });
   });
   document.querySelector("#recordQuizAttempt").addEventListener("click", () => submitQuizAttempt(quiz));
 }
 
 async function submitQuizAttempt(quiz) {
+  if (Object.keys(state.quizSelections).length !== quiz.questions.length || state.quizSubmitted) return;
+  state.quizSubmitted = true;
   const answers = quiz.questions.map((question, index) => ({
+    question_index: index,
     question: question.prompt,
     selected: state.quizSelections[index],
-    correct: question.answer,
     is_correct: state.quizSelections[index] === question.answer,
   }));
   const score = answers.filter((answer) => answer.is_correct).length;
+  quiz.questions.forEach((question, questionIndex) => {
+    const buttons = [...els.quizPanel.querySelectorAll(`button[data-q="${questionIndex}"]`)];
+    buttons.forEach((button, optionIndex) => {
+      button.disabled = true;
+      button.classList.remove("selected");
+      if (optionIndex === question.answer) button.classList.add("correct");
+      if (optionIndex === state.quizSelections[questionIndex] && optionIndex !== question.answer) button.classList.add("wrong");
+    });
+    const note = els.quizPanel.querySelector(`#answer-${questionIndex}`);
+    if (note) note.textContent = question.explain;
+  });
+  const submitButton = document.querySelector("#recordQuizAttempt");
+  submitButton.disabled = true;
+  submitButton.textContent = `${score}/${quiz.questions.length} · 正在保存`;
   await postJson("quiz-attempt", {
     quiz_id: quiz.id,
     lesson_id: state.currentLessonId,
@@ -3012,6 +3412,7 @@ async function submitQuizAttempt(quiz) {
     total: quiz.questions.length,
     answers,
   });
+  submitButton.textContent = `${score}/${quiz.questions.length} · 已记录`;
   await refreshLearningState();
 }
 
@@ -3182,6 +3583,12 @@ function registerCopyPayload(text) {
 }
 
 async function handleCopyClick(event) {
+  const accountOpenAction = event.target.closest("[data-account-open]");
+  if (accountOpenAction) {
+    openAccountModal();
+    return;
+  }
+
   const pdfAction = event.target.closest("[data-pdf-action]");
   if (pdfAction) {
     const action = pdfAction.dataset.pdfAction;
@@ -3230,9 +3637,14 @@ async function handleCopyClick(event) {
   if (jump) {
     state.currentLessonId = jump.dataset.jumpLesson;
     state.tab = "overview";
+    saveUiState();
     document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === "overview"));
+    renderControls();
     renderPhases(els.searchInput.value);
     renderLesson();
+    renderLab();
+    renderQuiz();
+    loadCurrentNotes();
     return;
   }
   const button = event.target.closest("[data-copy-id]");
@@ -3305,17 +3717,7 @@ function detectLanguage(code) {
 function highlightCodeLine(line, language) {
   if (!line) return "";
   if (language !== "python" && language !== "pseudo") return escapeHtml(line);
-
-  const hashIndex = line.indexOf("#");
-  const codePart = hashIndex >= 0 ? line.slice(0, hashIndex) : line;
-  const commentPart = hashIndex >= 0 ? line.slice(hashIndex) : "";
-  let html = escapeHtml(codePart);
-  html = html.replace(/(&quot;.*?&quot;|'.*?')/g, '<span class="token-string">$1</span>');
-  html = html.replace(/\b(def|return|for|in|if|else|from|import|assert|print|class|with|as|while|try|except)\b/g, '<span class="token-keyword">$1</span>');
-  html = html.replace(/\b(True|False|None|inf)\b/g, '<span class="token-constant">$1</span>');
-  html = html.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="token-number">$1</span>');
-  if (commentPart) html += `<span class="token-comment">${escapeHtml(commentPart)}</span>`;
-  return html;
+  return highlightPythonLine(line);
 }
 
 function runBpeStep(text) {
@@ -3596,6 +3998,11 @@ function lessonSearchText(lesson) {
     lesson.beginner_view,
     lesson.concepts.join(" "),
     lesson.practice.join(" "),
+    lesson.checkpoint,
+    lesson.code,
+    ...(lesson.math || []).flatMap((item) => [item.name, item.formula, item.latex, item.explain, item.validity]),
+    ...(lesson.checkpoints || []).flatMap((item) => [item.title, item.prompt, item.answer]),
+    ...(lesson.official_material?.focus_points || []),
   ]
     .join(" ")
     .toLowerCase();

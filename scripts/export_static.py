@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import shutil
+import subprocess
 import sys
 import urllib.request
 
@@ -22,13 +23,44 @@ def download_file(url, target, attempts=3, timeout=60):
     if not url:
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(f"{target.suffix}.part")
+    curl = shutil.which("curl")
+    if curl:
+        for attempt in range(1, attempts + 1):
+            result = subprocess.run(
+                [
+                    curl,
+                    "--fail",
+                    "--location",
+                    "--silent",
+                    "--show-error",
+                    "--retry",
+                    "2",
+                    "--retry-all-errors",
+                    "--connect-timeout",
+                    "20",
+                    "--max-time",
+                    str(timeout * 3),
+                    "--output",
+                    str(partial),
+                    url,
+                ],
+                check=False,
+            )
+            if result.returncode == 0 and partial.exists():
+                partial.replace(target)
+                return True
+            print(f"Warning: curl could not mirror {url} on attempt {attempt}/{attempts}")
+        partial.unlink(missing_ok=True)
+        return False
+
     last_error = None
     for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as response:
                 target.write_bytes(response.read())
             return True
-        except Exception as error:  # noqa: BLE001 - static export should keep working offline.
+        except Exception as error:  # noqa: BLE001 - retry and report all material failures together.
             last_error = error
             print(f"Warning: could not mirror {url} on attempt {attempt}/{attempts}: {error}")
     if last_error:
@@ -63,12 +95,13 @@ def main():
         shutil.rmtree(DIST)
     DIST.mkdir(parents=True)
 
-    for filename in ("index.html", "app.js", "styles.css", "config.js"):
+    for filename in ("index.html", "app.js", "styles.css", "config.js", "code-highlight.js", "pyodide-worker.js"):
         copy_file(FRONTEND / filename, DIST / filename)
 
     data_dir = DIST / "data"
     data_dir.mkdir()
     data = curriculum()
+    material_failures = []
 
     lectures_dir = data_dir / "lectures"
     for lesson in data["lessons"]:
@@ -77,7 +110,14 @@ def main():
         remote_url = material.get("reader_url", "")
         if local_url and remote_url:
             local_path = DIST / local_url
-            if download_file(remote_url, local_path) and material.get("kind") == "slides-pdf":
+            downloaded = download_file(remote_url, local_path)
+            if not downloaded:
+                material_failures.append(f"{lesson['id']}: could not mirror {remote_url}")
+                continue
+            if local_path.stat().st_size < 100:
+                material_failures.append(f"{lesson['id']}: mirrored material is unexpectedly small")
+                continue
+            if material.get("kind") == "slides-pdf":
                 stem = local_path.stem
                 public_dir = f"data/lectures/{stem}"
                 page_images = render_pdf_pages(local_path, lectures_dir / stem, public_dir)
@@ -86,6 +126,12 @@ def main():
                 material["reader_mode"] = "image-deck" if page_images else "pdf-source"
                 if page_images:
                     local_path.unlink(missing_ok=True)
+                else:
+                    material_failures.append(f"{lesson['id']}: PDF could not be rendered into in-platform pages")
+
+    if material_failures:
+        details = "\n".join(f"- {item}" for item in material_failures)
+        raise RuntimeError(f"Static export is incomplete; refusing to publish:\n{details}")
 
     (data_dir / "curriculum.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2),

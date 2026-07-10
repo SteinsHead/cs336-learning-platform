@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CS336 从零学习平台</title>
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=20260710d" />
   </head>
   <body>
     <div id="app">
@@ -36,7 +36,10 @@
         <aside class="sidebar">
           <div class="section-heading">
             <span>学习阶段</span>
-            <button id="resetProgress" class="ghost-button" type="button">重置</button>
+            <div class="sidebar-actions">
+              <button id="mobileCurriculumToggle" class="ghost-button mobile-curriculum-toggle" type="button" aria-expanded="false" aria-controls="phaseList">展开目录</button>
+              <button id="resetProgress" class="ghost-button" type="button">重置</button>
+            </div>
           </div>
           <div id="phaseList" class="phase-list"></div>
         </aside>
@@ -55,7 +58,7 @@
             <button class="tab" data-tab="source" type="button">讲义</button>
             <button class="tab" data-tab="math" type="button">数学</button>
             <button class="tab" data-tab="code" type="button">代码</button>
-            <button class="tab" data-tab="practice" type="button">练习</button>
+            <button class="tab" data-tab="practice" type="button">实践</button>
             <button class="tab" data-tab="map" type="button">知识图</button>
             <button class="tab" data-tab="mastery" type="button">标准</button>
             <button class="tab" data-tab="system" type="button">闭环</button>
@@ -81,14 +84,19 @@
             <div id="nextActionPanel" class="console-stack"></div>
             <div class="console-divider"></div>
             <div class="panel-title compact-title"><span>掌握证据</span></div>
-            <textarea id="evidenceText" class="plain-editor" placeholder="写下你对当前课程的解释、推导、实验结果或仍然不懂的问题。"></textarea>
+            <textarea id="evidenceText" class="plain-editor" placeholder="至少写清：为什么成立、公式或 shape、代码/实验对应点，以及一个适用边界。"></textarea>
             <div class="lab-row">
               <label for="evidenceConfidence">信心</label>
               <input id="evidenceConfidence" type="range" min="0" max="3" step="1" value="2" />
             </div>
             <button id="saveEvidence" class="secondary-button" type="button">提交证据</button>
             <div class="console-divider"></div>
-            <div class="panel-title compact-title"><span>复习结果</span></div>
+            <div class="panel-title compact-title"><span>本讲笔记</span></div>
+            <textarea id="notesText" class="plain-editor compact-editor" placeholder="记录疑问、错题、讲义页码和自己的解释。"></textarea>
+            <button id="saveNotes" class="ghost-button" type="button">保存笔记</button>
+            <div class="console-divider"></div>
+            <div class="panel-title compact-title"><span>闭卷回忆</span></div>
+            <textarea id="reviewRecallText" class="plain-editor compact-editor" placeholder="先不看讲义，写出本讲核心公式、代码路径和一个易错点，再评价难度。"></textarea>
             <div class="review-buttons">
               <button data-review="again" type="button">重来</button>
               <button data-review="hard" type="button">困难</button>
@@ -99,7 +107,7 @@
 
           <section class="panel">
             <div class="panel-title">
-              <span>交互实验</span>
+              <span>本讲实验</span>
               <select id="labSelect" aria-label="选择实验"></select>
             </div>
             <div id="labPanel"></div>
@@ -118,7 +126,7 @@
 
           <section class="panel">
             <div class="panel-title">
-              <span>自测</span>
+              <span>本讲自测</span>
               <select id="quizSelect" aria-label="选择自测"></select>
             </div>
             <div id="quizPanel"></div>
@@ -139,6 +147,6 @@
       </div>
     </div>
     <script src="config.js"></script>
-    <script src="app.js" type="module"></script>
+    <script src="app.js?v=20260710e" type="module"></script>
   </body>
 </html>

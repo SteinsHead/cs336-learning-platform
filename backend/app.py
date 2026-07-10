@@ -23,6 +23,7 @@ from backend.content import (  # noqa: E402
     lesson_by_id,
     quiz_by_id,
 )
+from backend.assessments import PRACTICE_STUDIOS, studio_by_id  # noqa: E402
 from backend.state import (  # noqa: E402
     add_evidence,
     add_lab_attempt,
@@ -119,6 +120,19 @@ class LearningAppHandler(SimpleHTTPRequestHandler):
             self.json_response({"labs": LABS})
             return
 
+        if path == "/api/practice-studios":
+            self.json_response({"practice_studios": PRACTICE_STUDIOS})
+            return
+
+        if path.startswith("/api/practice-studios/"):
+            task_id = unquote(path.rsplit("/", 1)[-1])
+            task = studio_by_id(task_id)
+            if task is None:
+                self.json_response({"error": "practice studio not found"}, status=404)
+                return
+            self.json_response(task)
+            return
+
         if path == "/api/mastery":
             self.json_response({"source_map": SOURCE_MAP, "mastery_gates": MASTERY_GATES})
             return
@@ -177,7 +191,10 @@ class LearningAppHandler(SimpleHTTPRequestHandler):
             elif path == "/api/progress":
                 result = update_lesson_progress(payload)
             elif path == "/api/quiz-attempt":
-                result = add_quiz_attempt(payload)
+                quiz = quiz_by_id(payload.get("quiz_id"))
+                if quiz is None:
+                    raise ValueError("unknown quiz")
+                result = add_quiz_attempt(payload, quiz)
             elif path == "/api/evidence":
                 result = add_evidence(payload)
             elif path == "/api/diagnostic":
@@ -193,8 +210,8 @@ class LearningAppHandler(SimpleHTTPRequestHandler):
             else:
                 self.json_response({"error": "not found"}, status=404)
                 return
-        except KeyError as error:
-            self.json_response({"error": f"missing field: {error}"}, status=400)
+        except (KeyError, ValueError, TypeError) as error:
+            self.json_response({"error": f"invalid request: {error}"}, status=400)
             return
         self.json_response({"state": result, "dashboard": dashboard(curriculum())})
 

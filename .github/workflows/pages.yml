@@ -33,10 +33,19 @@ jobs:
           node-version: "22"
 
       - name: Validate Python modules
-        run: python -B -m py_compile backend/app.py backend/content.py backend/state.py scripts/export_static.py
+        run: python -B -m py_compile backend/app.py backend/assessments.py backend/content.py backend/state.py scripts/export_static.py
 
       - name: Validate frontend syntax
-        run: node --check frontend/app.js
+        run: |
+          node --check frontend/app.js
+          node --check frontend/code-highlight.js
+          node --check frontend/pyodide-worker.js
+
+      - name: Run Python tests
+        run: python -B -m unittest discover -v
+
+      - name: Run frontend tests
+        run: node --test tests/*.test.mjs
 
       - name: Install PDF renderer
         run: python -m pip install pymupdf
@@ -68,7 +77,26 @@ jobs:
           PY
 
       - name: Validate static curriculum
-        run: python -B -c "import json; data=json.load(open('dist/data/curriculum.json', encoding='utf-8')); assert len(data['lessons']) == 22; assert len([m for l in data['lessons'] for m in l.get('math', [])]) == 29"
+        run: |
+          python -B - <<'PY'
+          import json
+          import xml.etree.ElementTree as ET
+
+          with open("dist/data/curriculum.json", encoding="utf-8") as file:
+              data = json.load(file)
+          lesson_ids = {lesson["id"] for lesson in data["lessons"]}
+          assert len(lesson_ids) == 22
+          assert {quiz["lesson_id"] for quiz in data["quizzes"]} == lesson_ids
+          assert {lesson_id for task in data["practice_studios"] for lesson_id in task["lesson_ids"]} == lesson_ids
+          math_items = [item for lesson in data["lessons"] for item in lesson.get("math", [])]
+          assert len(math_items) >= 29
+          for item in math_items:
+              ET.fromstring(item["mathml"])
+          for lesson in data["lessons"]:
+              material = lesson["official_material"]
+              if material["kind"] == "slides-pdf":
+                  assert material["page_count"] > 0, lesson["id"]
+          PY
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5

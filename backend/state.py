@@ -2,6 +2,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
+import re
 import threading
 import uuid
 
@@ -182,15 +183,39 @@ def update_lesson_progress(payload):
     return state
 
 
-def add_quiz_attempt(payload):
+def add_quiz_attempt(payload, quiz=None):
     state = load_state()
+    if quiz is None:
+        raise ValueError("quiz definition is required")
+    lesson_id = payload.get("lesson_id")
+    if quiz.get("lesson_id") != lesson_id:
+        raise ValueError("quiz does not belong to this lesson")
+    submitted = payload.get("answers", [])
+    selected_by_index = {
+        index: item.get("selected")
+        for index, item in enumerate(submitted)
+        if isinstance(item, dict)
+    }
+    answers = []
+    for index, question in enumerate(quiz.get("questions", [])):
+        selected = selected_by_index.get(index)
+        answers.append(
+            {
+                "question": question["prompt"],
+                "selected": selected,
+                "correct": question["answer"],
+                "is_correct": selected == question["answer"],
+            }
+        )
+    score = sum(1 for answer in answers if answer["is_correct"])
+    total = len(answers)
     attempt = {
         "id": str(uuid.uuid4()),
-        "quiz_id": payload.get("quiz_id"),
-        "lesson_id": payload.get("lesson_id"),
-        "score": int(payload.get("score", 0)),
-        "total": int(payload.get("total", 0)),
-        "answers": payload.get("answers", []),
+        "quiz_id": quiz["id"],
+        "lesson_id": lesson_id,
+        "score": score,
+        "total": total,
+        "answers": answers,
         "created_at": now_iso(),
     }
     attempt["percent"] = round(100 * attempt["score"] / max(1, attempt["total"]))
@@ -283,11 +308,15 @@ def add_review(payload):
     state = load_state()
     lesson_id = payload["lesson_id"]
     quality = payload.get("quality", "good")
+    recall_text = str(payload.get("recall_text", "")).strip()
+    if len(recall_text) < 30:
+        raise ValueError("review recall must contain at least 30 characters")
     current = state.setdefault("reviews", {}).get(lesson_id, {})
     interval = next_interval(current.get("interval_days", 0), quality)
     review = {
         "lesson_id": lesson_id,
         "quality": quality,
+        "recall_text": recall_text,
         "interval_days": interval,
         "last_reviewed_at": now_iso(),
         "due_at": (datetime.now(timezone.utc) + timedelta(days=interval)).replace(microsecond=0).isoformat(),
@@ -310,18 +339,23 @@ def next_interval(previous, quality):
 
 
 def score_evidence(text, confidence):
-    length_score = 0
-    if len(text) >= 600:
-        length_score = 3
-    elif len(text) >= 300:
-        length_score = 2
-    elif len(text) >= 120:
-        length_score = 1
-    confidence_score = min(3, max(0, confidence))
+    normalized = str(text or "").strip()
+    lower = normalized.lower()
+    dimensions = {
+        "reasoning": any(token in lower for token in ("因为", "所以", "因此", "前提", "because", "therefore")),
+        "math_or_shape": bool(re.search(r"[=<>]|\b(shape|softmax|loss|flops|bytes|kl)\b|概率|公式|维度", lower)),
+        "implementation": any(token in lower for token in ("代码", "伪代码", "def ", "tensor", "变量", "实验", "test", "assert")),
+        "boundary": any(token in lower for token in ("近似", "限制", "失败", "误区", "风险", "边界", "不能", "不等于")),
+    }
+    length_score = 2 if len(normalized) >= 300 else 1 if len(normalized) >= 160 else 0
+    rubric_score = sum(1 for value in dimensions.values() if value)
+    confidence_score = min(3, max(0, int(confidence)))
     return {
         "length_score": length_score,
         "confidence_score": confidence_score,
-        "ready_for_review": length_score >= 2 and confidence_score >= 2,
+        "rubric_score": rubric_score,
+        "dimensions": dimensions,
+        "ready_for_review": length_score >= 1 and rubric_score >= 3,
     }
 
 
@@ -330,7 +364,8 @@ def dashboard(curriculum):
     lessons = curriculum["lessons"]
     progress = state.get("lesson_progress", {})
     completed = [lesson_id for lesson_id, item in progress.items() if item.get("status") in {"completed", "mastered"}]
-    mastered = [lesson_id for lesson_id, item in progress.items() if item.get("status") == "mastered"]
+    mastery_rows = [lesson_mastery_row(lesson, state) for lesson in lessons]
+    mastered = [row["lesson_id"] for row in mastery_rows if row["score"] >= 90]
     due_reviews = review_queue(curriculum, state)
     next_actions = compute_next_actions(curriculum, state)
     phase_rows = []
@@ -392,7 +427,6 @@ def review_queue(curriculum, state=None):
 
 def compute_next_actions(curriculum, state=None):
     state = state or load_state()
-    progress = state.get("lesson_progress", {})
     actions = []
     if len(state.get("diagnostics", {})) < len(DIAGNOSTIC_ITEMS):
         actions.append(
@@ -416,14 +450,14 @@ def compute_next_actions(curriculum, state=None):
         )
 
     for lesson in curriculum["lessons"]:
-        item = progress.get(lesson["id"], {})
-        if item.get("status") not in {"completed", "mastered"}:
+        row = lesson_mastery_row(lesson, state)
+        if row["score"] < 75:
             actions.append(
                 {
                     "type": "learn",
                     "title": f"继续学习：{lesson['lecture']} · {lesson['title']}",
                     "lesson_id": lesson["id"],
-                    "reason": "这是当前路径中第一个未完成单元。",
+                    "reason": row["next_step"],
                 }
             )
             break
@@ -473,17 +507,17 @@ def learning_model(curriculum):
         "cycle": [
             {"id": "diagnose", "title": "诊断", "description": "先确认基础能力和学习目标。"},
             {"id": "learn", "title": "学习", "description": "按官方课程顺序学习概念、数学和代码。"},
-            {"id": "practice", "title": "实验", "description": "用玩具实验把公式变成可观察结果。"},
             {"id": "check", "title": "自测", "description": "用形成性测验发现误解。"},
+            {"id": "practice", "title": "实践", "description": "在浏览器 CPU 环境实现核心算法并通过测试。"},
             {"id": "evidence", "title": "证据", "description": "写出解释、伪代码或实验分析。"},
             {"id": "review", "title": "复习", "description": "按间隔复习巩固薄弱单元。"},
         ],
         "rubric": {
-            "progress": 35,
-            "quiz": 20,
+            "progress": 10,
+            "quiz": 25,
+            "practice": 30,
             "evidence": 20,
             "review": 15,
-            "diagnostic": 10,
         },
     }
 
@@ -495,8 +529,8 @@ def course_knowledge_graph(curriculum):
         nodes.append({"id": competency["id"], "type": "competency", "title": competency["title"]})
 
     lesson_by_id = {lesson["id"]: lesson for lesson in curriculum["lessons"]}
+    previous = None
     for phase in curriculum["roadmap"]:
-        previous = None
         for index, lesson_id in enumerate(phase["lessons"]):
             lesson = lesson_by_id.get(lesson_id)
             if not lesson:
@@ -555,22 +589,24 @@ def lesson_mastery_row(lesson, state):
     lesson_id = lesson["id"]
     progress = state.get("lesson_progress", {}).get(lesson_id, {})
     status = progress.get("status", "not_started")
-    progress_points = {"not_started": 0, "in_progress": 15, "completed": 30, "mastered": 35}.get(status, 0)
+    progress_points = {"not_started": 0, "in_progress": 3, "completed": 7, "mastered": 10}.get(status, 0)
 
     quiz = latest_quiz_for_lesson(state, lesson_id)
-    quiz_points = round((quiz["percent"] / 100) * 20) if quiz else 0
+    quiz_points = round((quiz["percent"] / 100) * 25) if quiz else 0
+
+    practice = best_practice_for_lesson(state, lesson_id)
+    practice_points = round((practice["percent"] / 100) * 30) if practice else 0
 
     evidence = best_evidence_for_lesson(state, lesson_id)
     evidence_points = evidence_points_for(evidence)
 
     review = state.get("reviews", {}).get(lesson_id)
-    review_points = min(15, int(review.get("count", 0)) * 5) if review else 0
-    if review and review.get("quality") == "easy":
-        review_points = min(15, review_points + 3)
+    review_points = min(15, int(review.get("count", 0)) * 4) if review and len(review.get("recall_text", "")) >= 30 else 0
+    if review_points and review.get("quality") == "easy":
+        review_points = min(15, review_points + 1)
 
-    diagnostic_points = diagnostic_points_for_lesson(state, lesson_id)
-    score = min(100, progress_points + quiz_points + evidence_points + review_points + diagnostic_points)
-    next_step = lesson_next_step(score, status, quiz, evidence, review)
+    score = min(100, progress_points + quiz_points + practice_points + evidence_points + review_points)
+    next_step = lesson_next_step(score, status, quiz, practice, evidence, review)
     return {
         "lesson_id": lesson_id,
         "title": lesson["title"],
@@ -582,11 +618,12 @@ def lesson_mastery_row(lesson, state):
         "components": {
             "progress": progress_points,
             "quiz": quiz_points,
+            "practice": practice_points,
             "evidence": evidence_points,
             "review": review_points,
-            "diagnostic": diagnostic_points,
         },
         "latest_quiz_percent": quiz["percent"] if quiz else None,
+        "latest_practice_percent": practice["percent"] if practice else None,
         "evidence_ready": bool(evidence and evidence.get("quality", {}).get("ready_for_review")),
         "review_count": int(review.get("count", 0)) if review else 0,
         "next_step": next_step,
@@ -605,10 +642,7 @@ def competency_mastery_rows(curriculum, state, lesson_rows):
         ]
         lesson_score = round(sum(lesson_scores) / max(1, len(lesson_scores)))
         diagnostic_score = diagnostic_by_comp.get(competency["id"])
-        if diagnostic_score is None:
-            score = round(lesson_score * 0.85)
-        else:
-            score = round(lesson_score * 0.7 + diagnostic_score * 0.3)
+        score = lesson_score
         weak_lesson_ids = [
             row["lesson_id"]
             for row in sorted(
@@ -633,11 +667,22 @@ def competency_mastery_rows(curriculum, state, lesson_rows):
 
 def study_plan(curriculum, state=None, weeks=4):
     state = state or load_state()
-    weeks = max(1, min(8, int(weeks or 4)))
-    weekly_hours = int(state.get("profile", {}).get("weekly_hours", 10) or 10)
+    profile = state.get("profile", {})
+    weekly_hours = int(profile.get("weekly_hours", 10) or 10)
     sessions_per_week = max(3, min(7, round(weekly_hours * 60 / 70)))
     lesson_rows = {row["lesson_id"]: row for row in [lesson_mastery_row(lesson, state) for lesson in curriculum["lessons"]]}
     pending_lessons = [lesson for lesson in curriculum["lessons"] if lesson_rows[lesson["id"]]["score"] < 75]
+    target_date = str(profile.get("target_date", "") or "")
+    available_weeks = None
+    if target_date:
+        try:
+            days = (datetime.fromisoformat(target_date).date() - datetime.now(timezone.utc).date()).days
+            available_weeks = max(1, (max(0, days) + 6) // 7)
+        except ValueError:
+            available_weeks = None
+    weeks = max(1, min(8, available_weeks or int(weeks or 4)))
+    required_sessions = len(pending_lessons)
+    pace_status = "on_track" if weeks * sessions_per_week >= required_sessions else "over_capacity"
     due = review_queue(curriculum, state)
     plan_weeks = []
     cursor = 0
@@ -652,7 +697,7 @@ def study_plan(curriculum, state=None, weeks=4):
                         "title": f"复习：{review['lecture']} · {review['title']}",
                         "lesson_id": review["lesson_id"],
                         "minutes": 25,
-                        "activities": ["回忆公式/代码路径", "用 again/hard/good/easy 记录复习质量"],
+                        "activities": ["先闭卷写回忆答案", "再对照公式/代码路径纠错", "记录复习质量"],
                     }
                 )
 
@@ -693,12 +738,18 @@ def study_plan(curriculum, state=None, weeks=4):
 
     return {
         "generated_at": now_iso(),
+        "goal": profile.get("goal", ""),
+        "level": profile.get("level", "beginner"),
+        "target_date": target_date,
+        "pace_status": pace_status,
+        "remaining_lessons": required_sessions,
         "weekly_hours": weekly_hours,
         "sessions_per_week": sessions_per_week,
         "rules": [
             "分数低于 75 的单元优先进入计划。",
             "到期复习在每周第一批 session 中优先安排。",
             "每个新单元必须覆盖概念、数学、代码和产出证据。",
+            "诊断只调整提示和优先级，不直接增加掌握分。",
         ],
         "weeks": plan_weeks,
     }
@@ -716,13 +767,25 @@ def best_evidence_for_lesson(state, lesson_id):
     return sorted(evidence, key=lambda item: evidence_points_for(item), reverse=True)[0]
 
 
+def best_practice_for_lesson(state, lesson_id):
+    attempts = []
+    for item in state.get("lab_attempts", []):
+        if item.get("lesson_id") != lesson_id or not str(item.get("lab_id", "")).startswith("studio:"):
+            continue
+        metrics = item.get("metrics", {})
+        total = int(metrics.get("total", 0) or 0)
+        passed = int(metrics.get("passed", 0) or 0)
+        if total <= 0:
+            continue
+        attempts.append({**item, "percent": round(100 * passed / total)})
+    return max(attempts, key=lambda item: item["percent"], default=None)
+
+
 def evidence_points_for(evidence):
     if not evidence:
         return 0
     quality = evidence.get("quality", {})
-    points = quality.get("length_score", 0) * 4 + quality.get("confidence_score", 0) * 2
-    if quality.get("ready_for_review"):
-        points += 2
+    points = quality.get("length_score", 0) * 4 + quality.get("rubric_score", 0) * 3
     return min(20, points)
 
 
@@ -753,13 +816,17 @@ def score_status(score):
     return "薄弱"
 
 
-def lesson_next_step(score, status, quiz, evidence, review):
+def lesson_next_step(score, status, quiz, practice, evidence, review):
     if status == "not_started":
         return "先读总览，再完成数学和代码页面的逐条讲解。"
     if not quiz:
         return "完成形成性自测，让系统知道误解在哪里。"
     if quiz["percent"] < 80:
         return "重做测验，并把错题写成一条笔记。"
+    if not practice:
+        return "完成本讲 CPU 实践任务，并通过自动测试。"
+    if practice["percent"] < 100:
+        return "修复实践任务中的失败测试，再解释错误原因。"
     if not evidence or not evidence.get("quality", {}).get("ready_for_review"):
         return "提交一份包含公式、shape 或伪代码的掌握证据。"
     if not review:
@@ -771,9 +838,9 @@ def lesson_next_step(score, status, quiz, evidence, review):
 
 def activities_for_score(score):
     if score < 25:
-        return ["读总览", "列出核心概念", "手抄并解释公式符号", "运行对应互动实验"]
+        return ["读总览", "列出核心概念", "手抄并解释公式符号", "运行 CPU 实践任务"]
     if score < 50:
-        return ["逐行读代码", "完成互动实验", "做形成性自测", "记录错题"]
+        return ["逐行读代码", "通过 CPU 实践测试", "做本讲形成性自测", "记录错题"]
     if score < 75:
         return ["补掌握证据", "复习错题", "对照官方材料修正理解"]
     return ["间隔复习", "把本讲内容讲给未来的自己", "进入下一讲"]

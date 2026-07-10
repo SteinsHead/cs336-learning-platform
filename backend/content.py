@@ -1,8 +1,13 @@
+from backend.assessments import LESSON_QUIZZES, PRACTICE_STUDIOS
+
+LECTURES_REVISION = "8b59b50730766695c2ffedd1a79c50cd09b9eb91"
+
 COURSE = {
     "title": "CS336 从零理解语言模型",
     "subtitle": "一个面向初学者的 Language Modeling from Scratch 学习路径",
     "source": "Stanford CS336 Spring 2026",
     "official_url": "https://cs336.stanford.edu/",
+    "materials_revision": LECTURES_REVISION,
     "philosophy": [
         "先建立直觉，再写最小代码，最后回到数学和系统代价。",
         "所有实验都使用玩具数据和可视化，不需要真的训练大模型。",
@@ -219,7 +224,7 @@ LESSON_SOURCE_URLS = {
 def raw_github_material_url(url):
     marker = "https://github.com/stanford-cs336/lectures/blob/main/"
     if url.startswith(marker):
-        return "https://raw.githubusercontent.com/stanford-cs336/lectures/main/" + url.removeprefix(marker)
+        return f"https://raw.githubusercontent.com/stanford-cs336/lectures/{LECTURES_REVISION}/" + url.removeprefix(marker)
     return url
 
 
@@ -227,7 +232,7 @@ def trace_source_url(url):
     if "trace=lecture_" not in url:
         return ""
     lecture_id = url.split("trace=", 1)[1].split("&", 1)[0]
-    return f"https://raw.githubusercontent.com/stanford-cs336/lectures/main/{lecture_id}.py"
+    return f"https://raw.githubusercontent.com/stanford-cs336/lectures/{LECTURES_REVISION}/{lecture_id}.py"
 
 
 def local_material_url(remote_url):
@@ -263,7 +268,7 @@ def official_material_for(lesson):
         "reader_url": reader_url,
         "local_reader_url": local_material_url(reader_url),
         "source_text_url": source_text_url,
-        "asset_base_url": "https://raw.githubusercontent.com/stanford-cs336/lectures/main/",
+        "asset_base_url": f"https://raw.githubusercontent.com/stanford-cs336/lectures/{LECTURES_REVISION}/",
         "download_url": material_url,
         "source_label": "Stanford CS336 official course materials",
         "usage_steps": [
@@ -546,9 +551,9 @@ def cross_entropy(probs, target_index):
             }
         ],
         "code": """for step, batch in enumerate(loader):
+    optimizer.zero_grad()
     logits = model(batch["input_ids"])
     loss = cross_entropy(logits, batch["targets"])
-    optimizer.zero_grad()
     loss.backward()
     optimizer.step()
     print(step, float(loss))""",
@@ -1043,8 +1048,8 @@ answer = language_model(joint_features)""",
         "id": "l18",
         "phase": "phase-5",
         "lecture": "Lecture 18",
-        "title": "Guest Lecture：研究视角 I",
-        "summary": "客座讲座通常强调课程知识如何进入真实研究和工程系统。",
+        "title": "Guest Lecture：Daniel Selsam",
+        "summary": "官网只公布了讲者 Daniel Selsam，尚未发布独立讲义；本单元提供不绑定具体主题的研究讲座阅读框架。",
         "beginner_view": "这类课不用追每个细节，重点是识别：它解决的瓶颈属于数据、模型、系统、评测还是对齐。",
         "concepts": ["research framing", "ablation", "baseline", "failure mode", "deployment constraint"],
         "math": [
@@ -1069,8 +1074,8 @@ answer = language_model(joint_features)""",
         "id": "l19",
         "phase": "phase-5",
         "lecture": "Lecture 19",
-        "title": "Guest Lecture：研究视角 II 与总复盘",
-        "summary": "课程最后要把所有模块串起来：数据进入 tokenizer，模型训练出能力，系统决定成本，评测暴露问题，后训练塑造行为。",
+        "title": "Guest Lecture：Dan Fu 与课程总复盘",
+        "summary": "官网只公布了讲者 Dan Fu，尚未发布独立讲义；课程总复盘是本平台补充，用于串联数据、模型、系统、评测与后训练。",
         "beginner_view": "你最终要能从一个模型产品倒推：它需要什么数据、模型结构、训练预算、推理系统、评测和对齐策略。",
         "concepts": ["end-to-end pipeline", "tradeoff", "risk", "iteration loop", "model card"],
         "math": [
@@ -1193,62 +1198,7 @@ LABS = [
 ]
 
 
-QUIZZES = [
-    {
-        "id": "q-basics",
-        "title": "基础自测",
-        "questions": [
-            {
-                "prompt": "语言模型训练时最直接优化的目标是什么？",
-                "options": ["提高真实下一个 token 的概率", "让词表越大越好", "让模型输出越长越好", "让所有 token 概率相等"],
-                "answer": 0,
-                "explain": "自回归 LM 最大化 p(x_t | x_<t)，等价于最小化负对数似然。",
-            },
-            {
-                "prompt": "为什么 BPE 比纯词级 tokenizer 更稳健？",
-                "options": ["可以用子词组合处理没见过的词", "完全不需要词表", "让序列一定更长", "会自动理解语义"],
-                "answer": 0,
-                "explain": "BPE 在字符/字节和词之间折中，能用已有子词表示罕见词。",
-            },
-        ],
-    },
-    {
-        "id": "q-systems",
-        "title": "系统自测",
-        "questions": [
-            {
-                "prompt": "FlashAttention 的核心收益主要来自哪里？",
-                "options": ["减少 HBM 读写和中间矩阵存储", "改变 attention 公式", "减少模型层数", "删除 softmax"],
-                "answer": 0,
-                "explain": "FlashAttention 是 exact attention，主要通过分块和 online softmax 降低 IO 成本。",
-            },
-            {
-                "prompt": "数据并行训练为什么需要 all-reduce？",
-                "options": ["同步不同 GPU 上的梯度", "复制训练数据到硬盘", "把 token 重新分词", "改变优化器公式"],
-                "answer": 0,
-                "explain": "每张卡计算局部梯度，all-reduce 后得到全局 batch 的平均梯度。",
-            },
-        ],
-    },
-    {
-        "id": "q-data-align",
-        "title": "数据与对齐自测",
-        "questions": [
-            {
-                "prompt": "数据去重的主要目的是什么？",
-                "options": ["降低重复样本导致的记忆和评测污染", "让所有文本变短", "替代 tokenizer", "让模型不需要训练"],
-                "answer": 0,
-                "explain": "重复数据会造成记忆、浪费算力，并可能污染评测集。",
-            },
-            {
-                "prompt": "SFT 与 RLVR 的主要区别是什么？",
-                "options": ["SFT 学示范答案，RLVR 用可验证奖励优化行为", "SFT 不用文本", "RLVR 只能训练 tokenizer", "两者没有区别"],
-                "answer": 0,
-                "explain": "SFT 是监督学习；RLVR 依赖自动可验证的奖励信号。",
-            },
-        ],
-    },
-]
+QUIZZES = LESSON_QUIZZES
 
 
 GLOSSARY = [
@@ -1277,6 +1227,7 @@ def curriculum():
         "mastery_gates": MASTERY_GATES,
         "labs": LABS,
         "quizzes": QUIZZES,
+        "practice_studios": PRACTICE_STUDIOS,
         "glossary": GLOSSARY,
     }
 
@@ -1303,6 +1254,9 @@ def enriched_lessons():
         enriched["official_material"] = official_material_for(enriched)
         enriched["mastery_gate"] = mastery_gate_by_phase(lesson["phase"])
         enriched["precision_note"] = precision_note_for(lesson["id"])
+        quiz = next((item for item in QUIZZES if item.get("lesson_id") == lesson["id"]), None)
+        enriched["quiz_id"] = quiz["id"] if quiz else ""
+        enriched["studio_ids"] = [task["id"] for task in PRACTICE_STUDIOS if lesson["id"] in task["lesson_ids"]]
         lessons.append(enriched)
     return lessons
 
@@ -1572,7 +1526,7 @@ def code_explanation_for(lesson):
 
 def execution_order_for(code):
     if "loss.backward()" in code and "optimizer.step()" in code:
-        return ["取一个 batch。", "模型前向传播得到 logits。", "用 targets 计算 loss。", "清空旧梯度。", "反向传播计算新梯度。", "优化器更新参数。"]
+        return ["取一个 batch。", "清空上一步累积的旧梯度。", "模型前向传播得到 logits。", "用 targets 计算 loss。", "反向传播计算新梯度。", "优化器更新参数。"]
     if "softmax" in code and "cross_entropy" in code:
         return ["先把 logits 变成概率。", "再取出正确类别概率。", "最后取负 log 得到 loss。"]
     if "Counter" in code or "most_common_pair" in code:
@@ -1659,6 +1613,15 @@ def explain_code_line(line, lesson):
         return "奖励或 advantage 是强化学习训练信号，用来决定提高还是降低某个回答的概率。"
     if "encoder" in stripped or "projector" in stripped:
         return "多模态组件把不同模态编码成向量，并投影到语言模型可处理的表示空间。"
+    for operator, description in (
+        ("+=", "把右侧结果加到当前值"),
+        ("-=", "从当前值减去右侧结果"),
+        ("*=", "让当前值乘以右侧结果"),
+        ("/=", "让当前值除以右侧结果"),
+    ):
+        if operator in stripped:
+            left = stripped.split(operator, 1)[0].strip()
+            return f"原地更新 `{left}`：{description}。它会保留循环前几次迭代的状态。"
     if "=" in stripped:
         left = stripped.split("=", 1)[0].strip()
         return f"赋值语句。左边 `{left}` 保存右边计算结果，后续代码会继续使用这个中间量。"
@@ -1674,4 +1637,6 @@ def precision_note_for(lesson_id):
         return "本项目只解释 FlashAttention/Triton 的核心机制，不等价于完成官方 Triton kernel 实现。"
     if lesson_id in {"l15", "l16"}:
         return "本项目展示后训练/RL 的最小数学信号，不会替代官方作业中的真实实现和测试。"
+    if lesson_id in {"l18", "l19"}:
+        return "截至官方 Spring 2026 schedule，客座课只公布讲者、未发布独立材料；本平台的研究阅读框架与总复盘是补充内容，不代表讲者原始讲授主题。"
     return "本讲内容按官方 lecture 主题组织；中文解释是教学拆解，细节以官方材料为准。"
